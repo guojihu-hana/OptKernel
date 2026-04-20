@@ -55,7 +55,7 @@ def query_server(
     num_completions: int = 1,
     server_port: int = 30000,
     server_address: str = "localhost",
-    server_type: str = "sglang",
+    server_type: str = "local",
     model_name: str = "default",
     is_reasoning_model: bool = True,
     budget_tokens: int = 0,
@@ -68,22 +68,23 @@ def query_server(
     system_prompt = _merge_concise_system_instruction(system_prompt)
     match server_type:
         case "local":
-            from agents.llm_local import GenerationConfig, get_llm
+            from llm_local import GenerationConfig, get_llm
 
-            llm = get_llm(model_name)  # legacy fallback
+            # Same OpenAI-compatible URL as vllm; use server_address/server_port (defaults: localhost:30000).
+            llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
             model = model_name
 
         case "vllm":
-            from agents.llm_local import GenerationConfig, get_llm
+            from llm_local import GenerationConfig, get_llm
 
             llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
             model = model_name
 
         case "sglang":
-            from openai import OpenAI
-            url = f"http://{server_address}:{server_port}"
-            client = OpenAI(api_key=SGLANG_KEY, base_url=f"{url}/v1", timeout=None, max_retries=0)
-            model = "default"
+            from llm_local import GenerationConfig, get_llm
+
+            llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
+            model = model_name
 
         case "deepseek":
             from openai import OpenAI

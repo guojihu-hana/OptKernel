@@ -539,7 +539,7 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--atol", type=float, default=1e-4)
     p.add_argument("--rtol", type=float, default=1e-4)
-    p.add_argument("--server-type", type=str, default=os.environ.get("KERNEL_AGENT_SERVER", "openai"))
+    p.add_argument("--server-type", type=str, default=os.environ.get("KERNEL_AGENT_SERVER", "local"))
     p.add_argument("--server-address", type=str, default="localhost")
     p.add_argument("--server-port", type=int, default=30000)
     p.add_argument("--model", type=str, default=os.environ.get("KERNEL_AGENT_MODEL", "gpt-4o-mini"))
