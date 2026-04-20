@@ -1,0 +1,1 @@
+Same output rules as round 0: only imports, needed globals, get_inputs, get_init_inputs, Model (+ minimal CUDA helpers). No if __name__ == '__main__'.

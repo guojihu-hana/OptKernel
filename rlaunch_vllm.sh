@@ -1,0 +1,18 @@
+#!/bin/bash
+GPU_NUM=${1:-8}
+CPU_NUM=${2:-$((GPU_NUM * 8))}
+MEMORY=${3:-$((GPU_NUM * 64000))}
+echo "GPU_NUM: ${GPU_NUM}, CPU_NUM: ${CPU_NUM}, MEMORY: ${MEMORY}"
+
+rlaunch --gpu=${GPU_NUM} \
+    --cpu=${CPU_NUM} \
+    --memory=${MEMORY} \
+    --private-machine=yes \
+    --charged-group=sys_gpu \
+    --mount=gpfs://gpfs1/ailab-sys/guojihu:/mnt/shared-storage-user/ailab-sys/guojihu \
+    --mount=gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public \
+    --image=registry.h.pjlab.org.cn/ailab-sys-sys_gpu/vllm-gjh:glm51-cu129 \
+    --workdir=/mnt/shared-storage-user/ailab-sys/guojihu/CudaForge \
+    --entrypoint /bin/bash
+
+

@@ -1,0 +1,651 @@
+"""
+KernelBench CUDA rewrite agent: multi-round LLM -> kernel.py -> validate -> ncu.
+
+Per round under work_dir/round_{k:03d}/: kernel.py, prompt.txt, llm_output.txt, metrics.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional, Set
+
+# -----------------------------------------------------------------------------
+# LLM
+# -----------------------------------------------------------------------------
+
+from query_server import query_server
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+# -----------------------------------------------------------------------------
+# Prompts (text under prompts/; construction in build_prompts.py)
+# -----------------------------------------------------------------------------
+
+from build_prompts import (
+    build_user_prompt_round0,
+    build_user_prompt_roundk,
+    summarize_metrics_for_prompt,
+    system_prompt_round0,
+    system_prompt_roundk,
+)
+from run_ncu import (
+    PROFILE_K,
+    SKIP_K,
+    effective_ncu_metrics,
+    nccu_bin,
+    run_ncu_profile,
+)
+
+# -----------------------------------------------------------------------------
+# Extract ```python``` from LLM output
+# -----------------------------------------------------------------------------
+
+_FENCED_PYTHON = re.compile(
+    r"```(?:python|py)\s*\n(.*?)```",
+    re.DOTALL | re.IGNORECASE,
+)
+_ANY_FENCE = re.compile(r"```\s*\n(.*?)```", re.DOTALL)
+
+
+def extract_python_module(text: str) -> Optional[str]:
+    """
+    Extract ```python``` / ```py``` content. If there are multiple fences, use the
+    **last** one (models often put the final full file after earlier snippets).
+    """
+    if not text or not text.strip():
+        return None
+
+    py_blocks = [b.strip() for b in _FENCED_PYTHON.findall(text) if b.strip()]
+    if py_blocks:
+        return py_blocks[-1]
+
+    generic: list[str] = []
+    for gm in _ANY_FENCE.finditer(text):
+        block = gm.group(1).strip()
+        if "import" in block and "Model" in block:
+            generic.append(block)
+    if generic:
+        return generic[-1]
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Dynamic import
+# -----------------------------------------------------------------------------
+
+
+def import_kernelbench_file(path: Path, module_name: str) -> Any:
+    path = path.resolve()
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load spec for {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# -----------------------------------------------------------------------------
+# Tensor output comparison
+# -----------------------------------------------------------------------------
+
+
+def _move_tensors_to(obj: Any, device: Any) -> Any:
+    import torch
+
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    if isinstance(obj, tuple):
+        return tuple(_move_tensors_to(x, device) for x in obj)
+    if isinstance(obj, list):
+        return [_move_tensors_to(x, device) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _move_tensors_to(v, device) for k, v in obj.items()}
+    return obj
+
+
+def compare_outputs(
+    out_ref: Any,
+    out_gen: Any,
+    atol: float,
+    rtol: float,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    import torch
+
+    if type(out_ref) is not type(out_gen):
+        return False, {
+            "reason": "type_mismatch",
+            "type_ref": str(type(out_ref)),
+            "type_gen": str(type(out_gen)),
+        }
+
+    if isinstance(out_ref, torch.Tensor):
+        if out_ref.shape != out_gen.shape:
+            return False, {
+                "reason": "shape_mismatch",
+                "shape_ref": list(out_ref.shape),
+                "shape_gen": list(out_gen.shape),
+                "dtype_ref": str(out_ref.dtype),
+                "dtype_gen": str(out_gen.dtype),
+            }
+        if out_ref.dtype != out_gen.dtype:
+            return False, {
+                "reason": "dtype_mismatch",
+                "dtype_ref": str(out_ref.dtype),
+                "dtype_gen": str(out_gen.dtype),
+            }
+        diff = (out_ref.float() - out_gen.float()).abs().max().item()
+        ok = torch.allclose(out_ref, out_gen, atol=atol, rtol=rtol)
+        return ok, {
+            "max_abs_diff": float(diff),
+            "atol": atol,
+            "rtol": rtol,
+            "allclose": ok,
+        }
+
+    if isinstance(out_ref, (tuple, list)):
+        if len(out_ref) != len(out_gen):
+            return False, {
+                "reason": "length_mismatch",
+                "len_ref": len(out_ref),
+                "len_gen": len(out_gen),
+            }
+        max_diff = 0.0
+        for i, (a, b) in enumerate(zip(out_ref, out_gen)):
+            ok_i, info = compare_outputs(a, b, atol, rtol)
+            if not ok_i:
+                info = info or {}
+                info["output_index"] = i
+                return False, info
+            if info and "max_abs_diff" in info:
+                max_diff = max(max_diff, info["max_abs_diff"])
+        return True, {"max_abs_diff": max_diff, "allclose": True}
+
+    if isinstance(out_ref, dict):
+        if set(out_ref.keys()) != set(out_gen.keys()):
+            return False, {"reason": "dict_keys_mismatch"}
+        max_diff = 0.0
+        for k in out_ref:
+            ok_i, info = compare_outputs(out_ref[k], out_gen[k], atol, rtol)
+            if not ok_i:
+                info = info or {}
+                info["dict_key"] = k
+                return False, info
+            if info and "max_abs_diff" in info:
+                max_diff = max(max_diff, info["max_abs_diff"])
+        return True, {"max_abs_diff": max_diff, "allclose": True}
+
+    return out_ref == out_gen, {"reason": "non_tensor_equality", "equal": out_ref == out_gen}
+
+
+# -----------------------------------------------------------------------------
+# Validate reference vs generated (returns metrics dict for metrics.json)
+# -----------------------------------------------------------------------------
+
+
+def run_forward_validation(
+    task_path: Path,
+    kernel_path: Path,
+    seed: int,
+    atol: float,
+    rtol: float,
+    gen_module_name: str = "kernelbench_generated_uniq",
+) -> dict[str, Any]:
+    import torch
+
+    ref_name = "kernelbench_reference_uniq"
+
+    try:
+        ref_mod = import_kernelbench_file(task_path, ref_name)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "compile_error",
+            "compile_error": f"Failed to load reference file:\n{traceback.format_exc()}",
+        }
+
+    try:
+        gen_mod = import_kernelbench_file(kernel_path, gen_module_name)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "compile_error",
+            "compile_error": f"Failed to import generated kernel.py:\n{traceback.format_exc()}",
+        }
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        inputs = ref_mod.get_inputs()
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": f"reference get_inputs() failed:\n{traceback.format_exc()}",
+        }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        inputs_device = _move_tensors_to(inputs, device)
+        init_args = list(ref_mod.get_init_inputs())
+        model_ref = ref_mod.Model(*init_args).to(device)
+        model_gen = gen_mod.Model(*init_args).to(device)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": f"Model construction failed:\n{traceback.format_exc()}",
+        }
+
+    try:
+        if isinstance(inputs_device, torch.Tensor):
+            out_ref = model_ref(inputs_device)
+            out_gen = model_gen(inputs_device)
+        elif isinstance(inputs_device, (tuple, list)):
+            out_ref = model_ref(*inputs_device)
+            out_gen = model_gen(*inputs_device)
+        else:
+            out_ref = model_ref(inputs_device)
+            out_gen = model_gen(inputs_device)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": f"Forward pass failed:\n{traceback.format_exc()}",
+        }
+
+    ok, num_info = compare_outputs(out_ref, out_gen, atol, rtol)
+    if not ok:
+        return {
+            "runnable": False,
+            "status": "numerical_error",
+            "numerical_error": num_info
+            or {"reason": "comparison_failed"},
+        }
+
+    return {
+        "runnable": True,
+        "status": "success",
+        "numerical_check": num_info,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Agent config & run loop
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class AgentConfig:
+    task_path: Path
+    work_dir: Path
+    max_rounds: int = 5
+    stop_on_success: bool = False
+    seed: int = 0
+    atol: float = 1e-4
+    rtol: float = 1e-4
+    server_type: str = "local"
+    server_address: str = "localhost"
+    server_port: int = 30000
+    model_name: str = "GLM-5.1-FP8"
+    temperature: float = 0.1
+    max_tokens: int = 16384
+    # Thinking / reasoning API (see query_server is_reasoning_model). Default: on.
+    reasoning_enabled: bool = True
+    """If set, only these round indices use reasoning; all others do not."""
+    reasoning_only_rounds: Optional[Set[int]] = None
+    """Rounds where reasoning is forced off (when reasoning_only_rounds is unset)."""
+    reasoning_except_rounds: Optional[Set[int]] = None
+    run_ncu: bool = True
+    ncu_binary: str = field(default_factory=lambda: shutil.which("ncu") or "ncu")
+    ncu_metrics: list[str] = field(default_factory=list)
+    ncu_extra_args: list[str] = field(default_factory=list)
+    ncu_launch_skip: int = SKIP_K
+    ncu_launch_count: int = PROFILE_K
+
+
+class KernelBenchAgent:
+    def __init__(self, config: AgentConfig):
+        self.config = config
+        self._reference_source = config.task_path.read_text(encoding="utf-8")
+
+    def reasoning_for_round(self, round_idx: int) -> bool:
+        """Whether to enable thinking/reasoning for this round (query_server flag)."""
+        c = self.config
+        if not c.reasoning_enabled:
+            return False
+        if c.reasoning_only_rounds is not None:
+            return round_idx in c.reasoning_only_rounds
+        if c.reasoning_except_rounds:
+            return round_idx not in c.reasoning_except_rounds
+        return True
+
+    def round_dir(self, round_idx: int) -> Path:
+        return self.config.work_dir / f"round_{round_idx:03d}"
+
+    def write_metrics(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+
+    def call_llm(self, system: str, user: str, round_idx: int) -> str:
+        c = self.config
+        raw = query_server(
+            user,
+            system_prompt=system,
+            temperature=c.temperature,
+            max_tokens=c.max_tokens,
+            server_type=c.server_type,
+            server_address=c.server_address,
+            server_port=c.server_port,
+            model_name=c.model_name,
+            is_reasoning_model=self.reasoning_for_round(round_idx),
+            call_type="kernel_bench_agent",
+            round_idx=round_idx,
+        )
+        if isinstance(raw, dict):
+            return str(raw.get("text", ""))
+        if isinstance(raw, list):
+            return str(raw[0]) if raw else ""
+        return str(raw or "")
+
+    def run_round_llm_only(self, round_idx: int) -> dict[str, Any]:
+        """
+        Task (from init), build prompt, call LLM, extract ```python```, write
+        ``prompt.txt``, ``llm_output.txt``, and ``kernel.py`` if extraction succeeds.
+
+        If parsing fails, writes ``metrics.json`` and returns a **final** result dict
+        (``status: parse_error``). Otherwise returns a partial dict without
+        ``run_forward_validation`` / ncu; :meth:`run_round` continues from there.
+        """
+        c = self.config
+        rd = self.round_dir(round_idx)
+        rd.mkdir(parents=True, exist_ok=True)
+
+        kernel_path = rd / "kernel.py"
+        prompt_path = rd / "prompt.txt"
+        llm_out_path = rd / "llm_output.txt"
+        metrics_path = rd / "metrics.json"
+
+        if round_idx == 0:
+            system = system_prompt_round0()
+            user = build_user_prompt_round0(self._reference_source)
+        else:
+            prev_rd = self.round_dir(round_idx - 1)
+            pk = prev_rd / "kernel.py"
+            prev_kernel = (
+                pk.read_text(encoding="utf-8")
+                if pk.is_file()
+                else "# (previous round did not write kernel.py — e.g. parse_error)\n"
+            )
+            prev_metrics = prev_rd / "metrics.json"
+            summary = summarize_metrics_for_prompt(prev_metrics)
+            system = system_prompt_roundk()
+            user = build_user_prompt_roundk(self._reference_source, prev_kernel, summary)
+
+        prompt_path.write_text(
+            f"--- system ---\n{system}\n\n--- user ---\n{user}",
+            encoding="utf-8",
+        )
+
+        llm_raw = self.call_llm(system, user, round_idx)
+        llm_out_path.write_text(llm_raw, encoding="utf-8")
+
+        py_src = extract_python_module(llm_raw)
+        base: dict[str, Any] = {
+            "round": round_idx,
+            "task_path": str(c.task_path.resolve()),
+            "work_dir": str(rd.resolve()),
+        }
+
+        if py_src is None:
+            base.update(
+                {
+                    "runnable": False,
+                    "status": "parse_error",
+                    "parse_error": "No ```python ... ``` block found in LLM output.",
+                }
+            )
+            self.write_metrics(metrics_path, base)
+            return base
+
+        kernel_path.write_text(py_src, encoding="utf-8")
+        return base
+
+    def run_round(self, round_idx: int) -> dict[str, Any]:
+        c = self.config
+        rd = self.round_dir(round_idx)
+        kernel_path = rd / "kernel.py"
+        metrics_path = rd / "metrics.json"
+
+        base = self.run_round_llm_only(round_idx)
+        if base.get("status") == "parse_error":
+            return base
+
+        gen_mod_name = f"kernelbench_generated_r{round_idx}"
+        eval_timing: dict[str, Any] = {}
+        v_t0 = time.perf_counter()
+        v_ts0 = _utc_iso()
+        val = run_forward_validation(
+            c.task_path,
+            kernel_path,
+            seed=c.seed,
+            atol=c.atol,
+            rtol=c.rtol,
+            gen_module_name=gen_mod_name,
+        )
+        v_t1 = time.perf_counter()
+        v_ts1 = _utc_iso()
+        eval_timing["validation"] = {
+            "started_at": v_ts0,
+            "finished_at": v_ts1,
+            "seconds": round(v_t1 - v_t0, 6),
+        }
+        base.update(val)
+        base["eval_timing"] = eval_timing
+
+        if not val.get("runnable"):
+            self.write_metrics(metrics_path, base)
+            return base
+
+        # runnable: optional ncu
+        if c.run_ncu and shutil.which(nccu_bin(c.ncu_binary)):
+            metric_names = effective_ncu_metrics(c.ncu_metrics)
+            metrics_args: list[str] = ["--metrics", ",".join(metric_names)]
+
+            n_t0 = time.perf_counter()
+            n_ts0 = _utc_iso()
+            ncu_info = run_ncu_profile(
+                kernel_path,
+                rd,
+                c.ncu_binary,
+                metrics_args,
+                c.ncu_extra_args,
+                metric_names,
+                launch_skip=c.ncu_launch_skip,
+                launch_count=c.ncu_launch_count,
+            )
+            n_t1 = time.perf_counter()
+            n_ts1 = _utc_iso()
+            eval_timing["ncu"] = {
+                "started_at": n_ts0,
+                "finished_at": n_ts1,
+                "seconds": round(n_t1 - n_t0, 6),
+            }
+            base["ncu"] = ncu_info
+            if ncu_info.get("returncode") != 0:
+                base["status"] = "ncu_error"
+                base["ncu_error"] = {
+                    "message": "ncu process returned non-zero",
+                    "returncode": ncu_info.get("returncode"),
+                    "stderr_tail": ncu_info.get("stderr"),
+                }
+            else:
+                base["status"] = "success"
+        elif c.run_ncu:
+            base["ncu"] = {"skipped": True, "reason": "ncu not found on PATH"}
+            eval_timing["ncu"] = {"skipped": True, "reason": "ncu not found on PATH"}
+            base["status"] = "success"
+        else:
+            eval_timing["ncu"] = {"skipped": True, "reason": "run_ncu disabled in config"}
+            base["status"] = "success"
+
+        self.write_metrics(metrics_path, base)
+        return base
+
+    def run(self) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        c = self.config
+        c.work_dir.mkdir(parents=True, exist_ok=True)
+
+        for r in range(c.max_rounds):
+            m = self.run_round(r)
+            results.append(m)
+            if c.stop_on_success and m.get("status") == "success":
+                break
+
+        return results
+
+
+def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
+    p = argparse.ArgumentParser(description="KernelBench CUDA agent (multi-round)")
+    p.add_argument(
+        "--task-file",
+        type=str,
+        required=True,
+        help="Path to KernelBench reference .py",
+    )
+    p.add_argument("--work-dir", type=str, default="./kernel_bench_agent_runs")
+    p.add_argument("--max-rounds", type=int, default=5)
+    p.add_argument("--stop-on-success", action="store_true")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--atol", type=float, default=1e-4)
+    p.add_argument("--rtol", type=float, default=1e-4)
+    p.add_argument("--server-type", type=str, default=os.environ.get("KERNEL_AGENT_SERVER", "openai"))
+    p.add_argument("--server-address", type=str, default="localhost")
+    p.add_argument("--server-port", type=int, default=30000)
+    p.add_argument("--model", type=str, default=os.environ.get("KERNEL_AGENT_MODEL", "gpt-4o-mini"))
+    p.add_argument("--max-tokens", type=int, default=32768)
+    p.add_argument("--temperature", type=float, default=0.1)
+    p.add_argument("--no-ncu", action="store_true", help="Skip ncu profiling")
+    p.add_argument(
+        "--ncu-metrics",
+        type=str,
+        default="",
+        help="Comma-separated ncu metrics (--metrics a,b,c). "
+        "If omitted, uses run_ncu.DEFAULT_NCU_METRICS.",
+    )
+    p.add_argument(
+        "--ncu-extra",
+        type=str,
+        default="",
+        help="Extra args for ncu (space-separated)",
+    )
+    p.add_argument("--ncu-binary", type=str, default=os.environ.get("NCU_BINARY", "ncu"))
+    p.add_argument(
+        "--ncu-launch-skip",
+        type=int,
+        default=SKIP_K,
+        help=f"ncu --launch-skip (default {SKIP_K}, run_ncu.SKIP_K)",
+    )
+    p.add_argument(
+        "--ncu-launch-count",
+        type=int,
+        default=PROFILE_K,
+        help=f"ncu --launch-count (default {PROFILE_K}, run_ncu.PROFILE_K)",
+    )
+    p.add_argument(
+        "--no-reasoning",
+        action="store_true",
+        help="Disable thinking/reasoning mode for all rounds (query_server is_reasoning_model=False).",
+    )
+    p.add_argument(
+        "--reasoning-only-rounds",
+        type=str,
+        default="",
+        help="Comma-separated round indices (0-based) where reasoning is ON; other rounds OFF. "
+        "If set, overrides --reasoning-except-rounds.",
+    )
+    p.add_argument(
+        "--reasoning-except-rounds",
+        type=str,
+        default="",
+        help="Comma-separated rounds where reasoning is OFF; all other rounds ON (default thinking on).",
+    )
+    args = p.parse_args(argv)
+
+    def _parse_round_set(s: str) -> Optional[set[int]]:
+        s = (s or "").strip()
+        if not s:
+            return None
+        out: set[int] = set()
+        for part in s.split(","):
+            part = part.strip()
+            if part:
+                out.add(int(part))
+        return out
+
+    metrics_list = [x.strip() for x in args.ncu_metrics.split(",") if x.strip()]
+    extra_list = args.ncu_extra.split() if args.ncu_extra.strip() else []
+
+    only = _parse_round_set(args.reasoning_only_rounds)
+    exc = _parse_round_set(args.reasoning_except_rounds)
+
+    return AgentConfig(
+        task_path=Path(args.task_file).resolve(),
+        work_dir=Path(args.work_dir).resolve(),
+        max_rounds=args.max_rounds,
+        stop_on_success=args.stop_on_success,
+        seed=args.seed,
+        atol=args.atol,
+        rtol=args.rtol,
+        server_type=args.server_type,
+        server_address=args.server_address,
+        server_port=args.server_port,
+        model_name=args.model,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature,
+        reasoning_enabled=not args.no_reasoning,
+        reasoning_only_rounds=only,
+        reasoning_except_rounds=exc,
+        run_ncu=not args.no_ncu,
+        ncu_binary=args.ncu_binary,
+        ncu_metrics=metrics_list,
+        ncu_extra_args=extra_list,
+        ncu_launch_skip=args.ncu_launch_skip,
+        ncu_launch_count=args.ncu_launch_count,
+    )
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    cfg = parse_args(argv)
+    if not cfg.task_path.is_file():
+        print(f"Task file not found: {cfg.task_path}", file=sys.stderr)
+        return 1
+
+    agent = KernelBenchAgent(cfg)
+    agent.run()
+    print(f"Done. Artifacts under {cfg.work_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

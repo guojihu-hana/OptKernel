@@ -1,0 +1,1 @@
+Rewrite Model.forward with CUDA. Output only: required imports, any shared constants (e.g. N), get_inputs, get_init_inputs, Model, plus minimal helpers for the CUDA forward. Do not add if __name__ == '__main__' or any other entry code.
