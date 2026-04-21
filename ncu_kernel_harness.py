@@ -2,7 +2,7 @@
 Run under ``ncu`` to profile a KernelBench-style ``kernel.py`` (no ``__main__``).
 
 Loads the module, builds ``Model(*get_init_inputs())``, calls ``.eval()``, then repeats:
-``inputs = get_inputs()`` → forward, matching :func:`agent.run_forward_validation` call semantics.
+``inputs = get_inputs()`` → forward, matching :func:`run_validation.run_forward_validation` call semantics.
 """
 
 from __future__ import annotations

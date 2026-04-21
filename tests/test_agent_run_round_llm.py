@@ -1,7 +1,7 @@
 """
 Unit tests for KernelBenchAgent.run_round_llm_only (prompt → LLM → extract → save).
 
-Does not run run_forward_validation, ncu, or the real query_server.
+Does not run run_validation.run_forward_validation, ncu, or the real query_server.
 """
 
 from __future__ import annotations

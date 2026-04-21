@@ -11,12 +11,12 @@
 #   export SERVER_ADDRESS=10.102.207.7
 #   export SERVER_PORT=8000
 #   export MODEL_NAME=Qwen/Qwen2.5-7B-Instruct   # must match the model name vLLM serves
-#   ./run_kernel_agent_vllm.sh \
-#     --model "${MODEL_NAME}" \
-#     --task-file ./KernelBench/level1/1_Square_matrix_multiplication_.py \
-#     --work-dir ./runs/kgen_vllm \
-#     --max-rounds 3 \
-#     --no-ncu
+  # ./run_kernel_agent_vllm.sh \
+  #   --model "${MODEL_NAME}" \
+  #   --task-file ./KernelBench/level1/1_Square_matrix_multiplication_.py \
+  #   --work-dir ./runs/kgen_vllm \
+  #   --max-rounds 3 \
+  #   --no-ncu
 #   # Thinking/reasoning: default ON. Examples:
 #   #   --no-reasoning
 #   #   --reasoning-except-rounds 1,2

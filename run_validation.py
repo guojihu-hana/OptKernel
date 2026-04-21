@@ -1,0 +1,281 @@
+"""
+Reference vs generated kernel forward validation and lightweight timing.
+
+Used by :class:`agent.KernelBenchAgent` after writing ``kernel.py`` for a round.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Optional
+
+
+def import_kernelbench_file(path: Path, module_name: str) -> Any:
+    path = path.resolve()
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load spec for {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _move_tensors_to(obj: Any, device: Any) -> Any:
+    import torch
+
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    if isinstance(obj, tuple):
+        return tuple(_move_tensors_to(x, device) for x in obj)
+    if isinstance(obj, list):
+        return [_move_tensors_to(x, device) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _move_tensors_to(v, device) for k, v in obj.items()}
+    return obj
+
+
+def compare_outputs(
+    out_ref: Any,
+    out_gen: Any,
+    atol: float,
+    rtol: float,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    import torch
+
+    if type(out_ref) is not type(out_gen):
+        return False, {
+            "reason": "type_mismatch",
+            "type_ref": str(type(out_ref)),
+            "type_gen": str(type(out_gen)),
+        }
+
+    if isinstance(out_ref, torch.Tensor):
+        if out_ref.shape != out_gen.shape:
+            return False, {
+                "reason": "shape_mismatch",
+                "shape_ref": list(out_ref.shape),
+                "shape_gen": list(out_gen.shape),
+                "dtype_ref": str(out_ref.dtype),
+                "dtype_gen": str(out_gen.dtype),
+            }
+        if out_ref.dtype != out_gen.dtype:
+            return False, {
+                "reason": "dtype_mismatch",
+                "dtype_ref": str(out_ref.dtype),
+                "dtype_gen": str(out_gen.dtype),
+            }
+        diff = (out_ref.float() - out_gen.float()).abs().max().item()
+        ok = torch.allclose(out_ref, out_gen, atol=atol, rtol=rtol)
+        return ok, {
+            "max_abs_diff": float(diff),
+            "atol": atol,
+            "rtol": rtol,
+            "allclose": ok,
+        }
+
+    if isinstance(out_ref, (tuple, list)):
+        if len(out_ref) != len(out_gen):
+            return False, {
+                "reason": "length_mismatch",
+                "len_ref": len(out_ref),
+                "len_gen": len(out_gen),
+            }
+        max_diff = 0.0
+        for i, (a, b) in enumerate(zip(out_ref, out_gen)):
+            ok_i, info = compare_outputs(a, b, atol, rtol)
+            if not ok_i:
+                info = info or {}
+                info["output_index"] = i
+                return False, info
+            if info and "max_abs_diff" in info:
+                max_diff = max(max_diff, info["max_abs_diff"])
+        return True, {"max_abs_diff": max_diff, "allclose": True}
+
+    if isinstance(out_ref, dict):
+        if set(out_ref.keys()) != set(out_gen.keys()):
+            return False, {"reason": "dict_keys_mismatch"}
+        max_diff = 0.0
+        for k in out_ref:
+            ok_i, info = compare_outputs(out_ref[k], out_gen[k], atol, rtol)
+            if not ok_i:
+                info = info or {}
+                info["dict_key"] = k
+                return False, info
+            if info and "max_abs_diff" in info:
+                max_diff = max(max_diff, info["max_abs_diff"])
+        return True, {"max_abs_diff": max_diff, "allclose": True}
+
+    return out_ref == out_gen, {"reason": "non_tensor_equality", "equal": out_ref == out_gen}
+
+
+# Mean forward latency after numerical match (reference vs generated).
+BENCHMARK_FORWARD_ITERATIONS = 10
+BENCHMARK_FORWARD_WARMUP = 10
+
+
+def _forward_module(model: Any, inputs_device: Any) -> Any:
+    """Single forward matching :func:`run_forward_validation` call semantics."""
+    import torch
+
+    if isinstance(inputs_device, torch.Tensor):
+        return model(inputs_device)
+    if isinstance(inputs_device, (tuple, list)):
+        return model(*inputs_device)
+    return model(inputs_device)
+
+
+def _mean_forward_latency_seconds(
+    model: Any,
+    inputs_device: Any,
+    *,
+    iterations: int,
+    warmup: int,
+    cuda_sync: bool,
+) -> float:
+    import torch
+
+    for _ in range(warmup):
+        _forward_module(model, inputs_device)
+        if cuda_sync:
+            torch.cuda.synchronize()
+    times: list[float] = []
+    for _ in range(iterations):
+        if cuda_sync:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _forward_module(model, inputs_device)
+        if cuda_sync:
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+    return sum(times) / len(times)
+
+
+def run_forward_validation(
+    task_path: Path,
+    kernel_path: Path,
+    seed: int,
+    atol: float,
+    rtol: float,
+    gen_module_name: str = "kernelbench_generated_uniq",
+) -> dict[str, Any]:
+    import torch
+
+    ref_name = "kernelbench_reference_uniq"
+
+    try:
+        ref_mod = import_kernelbench_file(task_path, ref_name)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "compile_error",
+            "compile_error": f"Failed to load reference file:\n{traceback.format_exc()}",
+        }
+
+    try:
+        gen_mod = import_kernelbench_file(kernel_path, gen_module_name)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "compile_error",
+            "compile_error": f"Failed to import generated kernel.py:\n{traceback.format_exc()}",
+        }
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    try:
+        inputs = ref_mod.get_inputs()
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": f"reference get_inputs() failed:\n{traceback.format_exc()}",
+        }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        inputs_device = _move_tensors_to(inputs, device)
+        init_args = list(ref_mod.get_init_inputs())
+        model_ref = ref_mod.Model(*init_args).to(device)
+        model_gen = gen_mod.Model(*init_args).to(device)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": f"Model construction failed:\n{traceback.format_exc()}",
+        }
+
+    try:
+        if isinstance(inputs_device, torch.Tensor):
+            out_ref = model_ref(inputs_device)
+            out_gen = model_gen(inputs_device)
+        elif isinstance(inputs_device, (tuple, list)):
+            out_ref = model_ref(*inputs_device)
+            out_gen = model_gen(*inputs_device)
+        else:
+            out_ref = model_ref(inputs_device)
+            out_gen = model_gen(inputs_device)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": f"Forward pass failed:\n{traceback.format_exc()}",
+        }
+
+    ok, num_info = compare_outputs(out_ref, out_gen, atol, rtol)
+    if not ok:
+        return {
+            "runnable": False,
+            "status": "numerical_error",
+            "numerical_error": num_info
+            or {"reason": "comparison_failed"},
+        }
+
+    benchmark_timing: dict[str, Any]
+    try:
+        cuda_sync = torch.cuda.is_available() and device.type == "cuda"
+        mean_ref = _mean_forward_latency_seconds(
+            model_ref,
+            inputs_device,
+            iterations=BENCHMARK_FORWARD_ITERATIONS,
+            warmup=BENCHMARK_FORWARD_WARMUP,
+            cuda_sync=cuda_sync,
+        )
+        mean_gen = _mean_forward_latency_seconds(
+            model_gen,
+            inputs_device,
+            iterations=BENCHMARK_FORWARD_ITERATIONS,
+            warmup=BENCHMARK_FORWARD_WARMUP,
+            cuda_sync=cuda_sync,
+        )
+        speedup: Optional[float] = None
+        if mean_gen > 0:
+            speedup = mean_ref / mean_gen
+        benchmark_timing = {
+            "iterations": BENCHMARK_FORWARD_ITERATIONS,
+            "warmup": BENCHMARK_FORWARD_WARMUP,
+            "device": "cuda" if cuda_sync else "cpu",
+            "mean_seconds_reference": round(mean_ref, 9),
+            "mean_seconds_generated": round(mean_gen, 9),
+            "speedup": round(speedup, 9) if speedup is not None else None,
+        }
+    except Exception:
+        benchmark_timing = {
+            "skipped": True,
+            "reason": traceback.format_exc(),
+        }
+
+    return {
+        "runnable": True,
+        "status": "success",
+        "numerical_check": num_info,
+        "benchmark_timing": benchmark_timing,
+    }
