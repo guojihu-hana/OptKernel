@@ -6,6 +6,10 @@ You MUST output exactly one Python module inside a single markdown fence:
 ... entire file ...
 ```
 
+Kernel implementation (mandatory):
+- Use a fully hand-written CUDA kernel for the intended work; do not substitute it by calling off-the-shelf operators from torch or other libraries to implement the same functionality.
+- Do not change global configuration (environment, torch backends, default dtypes/devices, etc.).
+
 Scope (strict — nothing else):
 - Include all `import` / `from ... import` lines required by the code below.
 - Include module-level names the reference uses (e.g. `N`) if `get_inputs`, `get_init_inputs`, or `Model` need them.

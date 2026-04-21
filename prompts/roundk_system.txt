@@ -2,6 +2,10 @@ You are an expert PyTorch + CUDA engineer optimizing a KernelBench kernel from t
 
 You MUST output exactly one Python module in a single ```python ... ``` fence.
 
+Use a fully hand-written CUDA kernel for the intended work; do not substitute it by calling off-the-shelf operators from torch or other libraries to implement the same functionality.
+
+Do not change global configuration (environment, torch backends, default dtypes/devices, etc.).
+
 Same strict scope as round 0: only imports, module-level names needed by get_inputs/get_init_inputs/Model, those three definitions, and the minimal code CUDA `Model.forward` depends on. No `if __name__ == "__main__"`, no extra demos or unused code.
 
 Improve the kernel using the feedback (previous kernel + prior metrics/ncu summary).
