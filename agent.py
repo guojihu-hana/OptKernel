@@ -114,6 +114,8 @@ class AgentConfig:
     ncu_extra_args: list[str] = field(default_factory=list)
     ncu_launch_skip: int = SKIP_K
     ncu_launch_count: int = PROFILE_K
+    # Bearer for OpenAI-compatible servers (local/vllm); required there via CLI --api-key.
+    openai_compatible_api_key: str = ""
 
 
 class KernelBenchAgent:
@@ -164,6 +166,7 @@ class KernelBenchAgent:
             call_type="kernel_bench_agent",
             round_idx=round_idx,
             stream_dump_path=str(llm_output_path) if llm_output_path else None,
+            openai_compatible_api_key=c.openai_compatible_api_key,
         )
         if isinstance(raw, dict):
             return str(raw.get("text", "")), llm_dumped
@@ -375,7 +378,22 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     p.add_argument("--server-type", type=str, default=os.environ.get("KERNEL_AGENT_SERVER", "local"))
     p.add_argument("--server-address", type=str, default="localhost")
     p.add_argument("--server-port", type=int, default=30000)
-    p.add_argument("--model", type=str, default=os.environ.get("KERNEL_AGENT_MODEL", "gpt-4o-mini"))
+    p.add_argument(
+        "--api-key",
+        type=str,
+        default="",
+        help="Bearer token for OpenAI-compatible servers. Required when --server-type is local or vllm "
+        "(must match vLLM --api-key). Ignored for other server types.",
+    )
+    p.add_argument(
+        "--model",
+        type=str,
+        default=(
+            os.environ.get("KERNEL_AGENT_MODEL")
+            or os.environ.get("MODEL_NAME")
+            or "gpt-4o-mini"
+        ),
+    )
     p.add_argument("--max-tokens", type=int, default=32768)
     p.add_argument("--temperature", type=float, default=0.1)
     p.add_argument("--no-ncu", action="store_true", help="Skip ncu profiling")
@@ -425,6 +443,11 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     )
     args = p.parse_args(argv)
 
+    _st = args.server_type.strip().lower()
+    _api_key = (args.api_key or "").strip()
+    if _st in {"local", "vllm"} and not _api_key:
+        p.error("--api-key is required when --server-type is local or vllm")
+
     task_path = Path(args.task_file).resolve()
     if args.work_dir:
         work_dir = Path(args.work_dir).expanduser().resolve()
@@ -472,6 +495,7 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         ncu_extra_args=extra_list,
         ncu_launch_skip=args.ncu_launch_skip,
         ncu_launch_count=args.ncu_launch_count,
+        openai_compatible_api_key=_api_key,
     )
 
 

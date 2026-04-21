@@ -71,6 +71,7 @@ def query_server(
     round_idx: int = -1,
     return_metadata: bool = False,
     stream_dump_path: Optional[str] = None,
+    openai_compatible_api_key: str = "",
 ):
     system_prompt = _merge_concise_system_instruction(system_prompt)
     match server_type:
@@ -78,19 +79,31 @@ def query_server(
             from llm_local import GenerationConfig, get_llm
 
             # Same OpenAI-compatible URL as vllm; use server_address/server_port (defaults: localhost:30000).
-            llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
+            llm = get_llm(
+                model_name,
+                server_url=f"http://{server_address}:{server_port}/v1",
+                api_key=openai_compatible_api_key or "EMPTY",
+            )
             model = model_name
 
         case "vllm":
             from llm_local import GenerationConfig, get_llm
 
-            llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
+            llm = get_llm(
+                model_name,
+                server_url=f"http://{server_address}:{server_port}/v1",
+                api_key=openai_compatible_api_key or "EMPTY",
+            )
             model = model_name
 
         case "sglang":
             from llm_local import GenerationConfig, get_llm
 
-            llm = get_llm(model_name, server_url=f"http://{server_address}:{server_port}/v1")
+            llm = get_llm(
+                model_name,
+                server_url=f"http://{server_address}:{server_port}/v1",
+                api_key=openai_compatible_api_key or "EMPTY",
+            )
             model = model_name
 
         case "deepseek":
@@ -249,50 +262,37 @@ def query_server(
     if server_type in {"local", "vllm"}:
         assert isinstance(prompt, str), "Only string prompt supported for local/vllm model"
         if return_metadata:
-            # Preserve finish_reason for auto-continue logic.
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ]
-            kwargs = dict(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                top_p=top_p,
-                max_tokens=max_tokens,
+            from llm_local import (
+                llm_streaming_enabled,
+                max_continuation_rounds,
+                max_token_continue_enabled,
+                openai_chat_completion_with_truncation_retry,
             )
+
+            extra_body = None
             if is_reasoning_model:
                 think_obj = {"type": "enabled"}
                 if int(budget_tokens or 0) > 0:
                     think_obj["budget_tokens"] = int(budget_tokens)
-                kwargs["extra_body"] = {"thinking": think_obj}
-            from llm_local import consume_chat_completion_stream, llm_streaming_enabled
-            import sys
+                extra_body = {"thinking": think_obj}
 
             _dp = (stream_dump_path or "").strip() or None
-            dumped_to_file = False
-            if llm_streaming_enabled():
-                kwargs["stream"] = True
-                stream = llm.client.chat.completions.create(**kwargs)
-                text, fr, dumped_to_file = consume_chat_completion_stream(stream, _dp)
-                finish_reason = str(fr) if fr else None
-            else:
-                response = llm.client.chat.completions.create(**kwargs)
-                text = ""
-                finish_reason = None
-                if response.choices:
-                    c0 = response.choices[0]
-                    text = str(getattr(c0.message, "content", "") or "")
-                    finish_reason = str(getattr(c0, "finish_reason", "") or "")
-                if _dp:
-                    Path(_dp).write_text(text, encoding="utf-8")
-                    print(
-                        f"\r[llm_output.txt] written: {len(text)} chars",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    print(file=sys.stderr)
-                    dumped_to_file = True
+            max_cont = 0 if not max_token_continue_enabled() else max_continuation_rounds()
+            text, finish_reason, dumped_to_file = openai_chat_completion_with_truncation_retry(
+                llm.client,
+                model=model,
+                system_prompt=system_prompt,
+                original_user=prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                seed=None,
+                extra_body=extra_body,
+                use_stream=llm_streaming_enabled(),
+                dump_path=_dp,
+                max_continuations=max_cont,
+                round_idx=round_idx,
+            )
             return _qs_ret(_pack(text, finish_reason), dumped_to_file)
 
         _dump = (stream_dump_path or "").strip() or None
@@ -304,6 +304,7 @@ def query_server(
             enable_thinking=bool(is_reasoning_model),
             thinking_budget_tokens=int(budget_tokens or 0),
             stream_dump_path=_dump,
+            round_idx=round_idx,
         )
 
         output, dumped_to_file = llm.chat(

@@ -24,7 +24,7 @@ if "query_server" not in sys.modules:
     _stub.query_server = _stub_query_server
     sys.modules["query_server"] = _stub
 
-from agent import AgentConfig, KernelBenchAgent, extract_python_module
+from agent import AgentConfig, KernelBenchAgent, extract_python_module, parse_args
 
 
 REF_SNIPPET = "KERNELBENCH_REFERENCE_UNIQUE_MARK_12345"
@@ -134,6 +134,44 @@ class TestRunRoundLlmOnly(unittest.TestCase):
         self.assertIn(REF_SNIPPET, captured["user"])
         rd = self.work_dir / "round_001"
         self.assertTrue((rd / "kernel.py").is_file())
+
+
+class TestParseArgsApiKey(unittest.TestCase):
+    def test_vllm_requires_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d) / "t.py"
+            t.write_text("# t", encoding="utf-8")
+            w = Path(d) / "w"
+            with self.assertRaises(SystemExit):
+                parse_args(
+                    [
+                        "--task-file",
+                        str(t),
+                        "--work-dir",
+                        str(w),
+                        "--server-type",
+                        "vllm",
+                    ]
+                )
+
+    def test_vllm_accepts_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            t = Path(d) / "t.py"
+            t.write_text("# t", encoding="utf-8")
+            w = Path(d) / "w"
+            cfg = parse_args(
+                [
+                    "--task-file",
+                    str(t),
+                    "--work-dir",
+                    str(w),
+                    "--server-type",
+                    "vllm",
+                    "--api-key",
+                    "secret",
+                ]
+            )
+            self.assertEqual(cfg.openai_compatible_api_key, "secret")
 
 
 class TestExtractPythonModule(unittest.TestCase):

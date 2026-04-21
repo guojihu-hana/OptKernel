@@ -14,6 +14,26 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+def _cuda_context_error_dict(exc: BaseException) -> dict[str, Any]:
+    """
+    Stale or poisoned CUDA context (e.g. illegal memory access from a bad generated kernel)
+    often surfaces at the *next* CUDA API call, not where the bug occurred.
+    """
+    return {
+        "runnable": False,
+        "status": "cuda_error",
+        "cuda_error": {
+            "message": (
+                "CUDA runtime error—often illegal memory access from a previously executed "
+                "generated kernel, reported asynchronously here. Restart this Python process "
+                "before further GPU validation. To pinpoint the kernel: CUDA_LAUNCH_BLOCKING=1 "
+                "or validate one round in a fresh process."
+            ),
+            "repr": repr(exc),
+        },
+    }
+
+
 def import_kernelbench_file(path: Path, module_name: str) -> Any:
     path = path.resolve()
     sys.modules.pop(module_name, None)
@@ -187,9 +207,19 @@ def run_forward_validation(
             "compile_error": f"Failed to import generated kernel.py:\n{traceback.format_exc()}",
         }
 
-    torch.manual_seed(seed)
+    # Drain prior async CUDA errors (bad kernels from earlier rounds can poison the context).
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            return _cuda_context_error_dict(e)
+
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception as e:
+        return _cuda_context_error_dict(e)
 
     try:
         inputs = ref_mod.get_inputs()
