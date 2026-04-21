@@ -62,10 +62,10 @@ class TestRunRoundLlmOnly(unittest.TestCase):
         )
 
     def test_round0_prompt_llm_extract_and_save(self) -> None:
-        def fake_call_llm(self_: KernelBenchAgent, system: str, user: str, round_idx: int) -> str:
+        def fake_call_llm(self_: KernelBenchAgent, system: str, user: str, round_idx: int, *_a, **_kw):
             self.assertIn(REF_SNIPPET, user)
             self.assertIn("CUDA", system)
-            return FAKE_KERNEL
+            return FAKE_KERNEL, False
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
@@ -93,9 +93,9 @@ class TestRunRoundLlmOnly(unittest.TestCase):
 
     def test_parse_error_writes_metrics_no_kernel(self) -> None:
         def fake_call_llm(
-            self_: KernelBenchAgent, system: str, user: str, round_idx: int
-        ) -> str:
-            return "no code fence here, only prose"
+            self_: KernelBenchAgent, system: str, user: str, round_idx: int, *_a, **_kw
+        ):
+            return "no code fence here, only prose", False
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
@@ -121,10 +121,10 @@ class TestRunRoundLlmOnly(unittest.TestCase):
 
         captured: dict[str, str] = {}
 
-        def fake_call_llm(self_: KernelBenchAgent, system: str, user: str, round_idx: int) -> str:
+        def fake_call_llm(self_: KernelBenchAgent, system: str, user: str, round_idx: int, *_a, **_kw):
             captured["user"] = user
             self.assertEqual(round_idx, 1)
-            return FAKE_KERNEL
+            return FAKE_KERNEL, False
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):

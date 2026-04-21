@@ -2,6 +2,7 @@
 KernelBench CUDA rewrite agent: multi-round LLM -> kernel.py -> validate -> ncu.
 
 Per round under work_dir/round_{k:03d}/: kernel.py, prompt.txt, llm_output.txt, metrics.json.
+Default work_dir (if --work-dir omitted): ./runs/<YYYYMMDDHHMMSS>/<task_file_stem>/.
 """
 
 from __future__ import annotations
@@ -192,6 +193,49 @@ def compare_outputs(
     return out_ref == out_gen, {"reason": "non_tensor_equality", "equal": out_ref == out_gen}
 
 
+# Mean forward latency after numerical match (reference vs generated).
+BENCHMARK_FORWARD_ITERATIONS = 10
+BENCHMARK_FORWARD_WARMUP = 10
+
+
+def _forward_module(model: Any, inputs_device: Any) -> Any:
+    """Single forward matching :func:`run_forward_validation` call semantics."""
+    import torch
+
+    if isinstance(inputs_device, torch.Tensor):
+        return model(inputs_device)
+    if isinstance(inputs_device, (tuple, list)):
+        return model(*inputs_device)
+    return model(inputs_device)
+
+
+def _mean_forward_latency_seconds(
+    model: Any,
+    inputs_device: Any,
+    *,
+    iterations: int,
+    warmup: int,
+    cuda_sync: bool,
+) -> float:
+    import torch
+
+    for _ in range(warmup):
+        _forward_module(model, inputs_device)
+        if cuda_sync:
+            torch.cuda.synchronize()
+    times: list[float] = []
+    for _ in range(iterations):
+        if cuda_sync:
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        _forward_module(model, inputs_device)
+        if cuda_sync:
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+    return sum(times) / len(times)
+
+
 # -----------------------------------------------------------------------------
 # Validate reference vs generated (returns metrics dict for metrics.json)
 # -----------------------------------------------------------------------------
@@ -279,10 +323,47 @@ def run_forward_validation(
             or {"reason": "comparison_failed"},
         }
 
+    benchmark_timing: dict[str, Any]
+    try:
+        import torch
+
+        cuda_sync = torch.cuda.is_available() and device.type == "cuda"
+        mean_ref = _mean_forward_latency_seconds(
+            model_ref,
+            inputs_device,
+            iterations=BENCHMARK_FORWARD_ITERATIONS,
+            warmup=BENCHMARK_FORWARD_WARMUP,
+            cuda_sync=cuda_sync,
+        )
+        mean_gen = _mean_forward_latency_seconds(
+            model_gen,
+            inputs_device,
+            iterations=BENCHMARK_FORWARD_ITERATIONS,
+            warmup=BENCHMARK_FORWARD_WARMUP,
+            cuda_sync=cuda_sync,
+        )
+        speedup: Optional[float] = None
+        if mean_gen > 0:
+            speedup = mean_ref / mean_gen
+        benchmark_timing = {
+            "iterations": BENCHMARK_FORWARD_ITERATIONS,
+            "warmup": BENCHMARK_FORWARD_WARMUP,
+            "device": "cuda" if cuda_sync else "cpu",
+            "mean_seconds_reference": round(mean_ref, 9),
+            "mean_seconds_generated": round(mean_gen, 9),
+            "speedup": round(speedup, 9) if speedup is not None else None,
+        }
+    except Exception:
+        benchmark_timing = {
+            "skipped": True,
+            "reason": traceback.format_exc(),
+        }
+
     return {
         "runnable": True,
         "status": "success",
         "numerical_check": num_info,
+        "benchmark_timing": benchmark_timing,
     }
 
 
@@ -346,9 +427,16 @@ class KernelBenchAgent:
             encoding="utf-8",
         )
 
-    def call_llm(self, system: str, user: str, round_idx: int) -> str:
+    def call_llm(
+        self,
+        system: str,
+        user: str,
+        round_idx: int,
+        llm_output_path: Optional[Path] = None,
+    ) -> tuple[str, bool]:
+        """Returns (completion_text, llm_output_already_written_to_disk)."""
         c = self.config
-        raw = query_server(
+        raw, llm_dumped = query_server(
             user,
             system_prompt=system,
             temperature=c.temperature,
@@ -360,12 +448,13 @@ class KernelBenchAgent:
             is_reasoning_model=self.reasoning_for_round(round_idx),
             call_type="kernel_bench_agent",
             round_idx=round_idx,
+            stream_dump_path=str(llm_output_path) if llm_output_path else None,
         )
         if isinstance(raw, dict):
-            return str(raw.get("text", ""))
+            return str(raw.get("text", "")), llm_dumped
         if isinstance(raw, list):
-            return str(raw[0]) if raw else ""
-        return str(raw or "")
+            return (str(raw[0]) if raw else ""), llm_dumped
+        return str(raw or ""), llm_dumped
 
     def run_round_llm_only(self, round_idx: int) -> dict[str, Any]:
         """
@@ -387,7 +476,7 @@ class KernelBenchAgent:
 
         if round_idx == 0:
             system = system_prompt_round0()
-            user = build_user_prompt_round0(self._reference_source)
+            user_body = build_user_prompt_round0(self._reference_source)
         else:
             prev_rd = self.round_dir(round_idx - 1)
             pk = prev_rd / "kernel.py"
@@ -399,21 +488,44 @@ class KernelBenchAgent:
             prev_metrics = prev_rd / "metrics.json"
             summary = summarize_metrics_for_prompt(prev_metrics)
             system = system_prompt_roundk()
-            user = build_user_prompt_roundk(self._reference_source, prev_kernel, summary)
+            user_body = build_user_prompt_roundk(self._reference_source, prev_kernel, summary)
 
-        prompt_path.write_text(
-            f"--- system ---\n{system}\n\n--- user ---\n{user}",
-            encoding="utf-8",
-        )
+        if not c.reasoning_enabled:
+            _no_reasoning_banner = (
+                "NO THINKING\n\nCRITICAL DIRECTLY OUTPUT THE CODE\n\n"
+            )
+            user = _no_reasoning_banner + user_body
+            prompt_path.write_text(
+                _no_reasoning_banner
+                + f"--- system ---\n{system}\n\n--- user ---\n{user_body}",
+                encoding="utf-8",
+            )
+        else:
+            user = user_body
+            prompt_path.write_text(
+                f"--- system ---\n{system}\n\n--- user ---\n{user_body}",
+                encoding="utf-8",
+            )
 
-        llm_raw = self.call_llm(system, user, round_idx)
-        llm_out_path.write_text(llm_raw, encoding="utf-8")
+        ll_t0 = time.perf_counter()
+        ll_ts0 = _utc_iso()
+        llm_raw, llm_written = self.call_llm(system, user, round_idx, llm_out_path)
+        ll_t1 = time.perf_counter()
+        ll_ts1 = _utc_iso()
+        llm_eval_timing = {
+            "started_at": ll_ts0,
+            "finished_at": ll_ts1,
+            "seconds": round(ll_t1 - ll_t0, 6),
+        }
+        if not llm_written:
+            llm_out_path.write_text(llm_raw, encoding="utf-8")
 
         py_src = extract_python_module(llm_raw)
         base: dict[str, Any] = {
             "round": round_idx,
             "task_path": str(c.task_path.resolve()),
             "work_dir": str(rd.resolve()),
+            "eval_timing": {"llm": llm_eval_timing},
         }
 
         if py_src is None:
@@ -441,7 +553,7 @@ class KernelBenchAgent:
             return base
 
         gen_mod_name = f"kernelbench_generated_r{round_idx}"
-        eval_timing: dict[str, Any] = {}
+        eval_timing: dict[str, Any] = dict(base.get("eval_timing") or {})
         v_t0 = time.perf_counter()
         v_ts0 = _utc_iso()
         val = run_forward_validation(
@@ -533,7 +645,13 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         required=True,
         help="Path to KernelBench reference .py",
     )
-    p.add_argument("--work-dir", type=str, default="./kernel_bench_agent_runs")
+    p.add_argument(
+        "--work-dir",
+        type=str,
+        default=None,
+        help="Output root (rounds go under work_dir/round_{k:03d}/). "
+        "If omitted: ./runs/<YYYYMMDDHHMMSS>/<task_file_stem>/ using current time and --task-file basename.",
+    )
     p.add_argument("--max-rounds", type=int, default=5)
     p.add_argument("--stop-on-success", action="store_true")
     p.add_argument("--seed", type=int, default=0)
@@ -592,6 +710,13 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     )
     args = p.parse_args(argv)
 
+    task_path = Path(args.task_file).resolve()
+    if args.work_dir:
+        work_dir = Path(args.work_dir).expanduser().resolve()
+    else:
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        work_dir = (Path.cwd() / "runs" / stamp / task_path.stem).resolve()
+
     def _parse_round_set(s: str) -> Optional[set[int]]:
         s = (s or "").strip()
         if not s:
@@ -610,8 +735,8 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     exc = _parse_round_set(args.reasoning_except_rounds)
 
     return AgentConfig(
-        task_path=Path(args.task_file).resolve(),
-        work_dir=Path(args.work_dir).resolve(),
+        task_path=task_path,
+        work_dir=work_dir,
         max_rounds=args.max_rounds,
         stop_on_success=args.stop_on_success,
         seed=args.seed,

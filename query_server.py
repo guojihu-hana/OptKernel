@@ -8,7 +8,7 @@ SGLANG_KEY = os.environ.get("SGLANG_API_KEY")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SAMBANOVA_API_KEY = os.environ.get("SAMBANOVA_API_KEY")
 FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
-from typing import Optional
+from typing import Any, Optional
 from pathlib import Path
 import json
 import time
@@ -45,6 +45,12 @@ def colorize_finish_reason(reason: Optional[str]) -> str:
     color = colors.get(reason, "\033[90m")  # Default to grey
     return f"{color}Finish reason: {reason}{reset_color}"
 
+
+def _qs_ret(result: Any, llm_output_dumped: bool = False) -> tuple[Any, bool]:
+    """Pair query_server payload with whether llm_output was written via stream_dump_path (local/vllm)."""
+    return (result, llm_output_dumped)
+
+
 def query_server(
     prompt: str | list[dict],
     system_prompt: str = "You are a helpful assistant",
@@ -64,6 +70,7 @@ def query_server(
     call_type: str = "unknown",
     round_idx: int = -1,
     return_metadata: bool = False,
+    stream_dump_path: Optional[str] = None,
 ):
     system_prompt = _merge_concise_system_instruction(system_prompt)
     match server_type:
@@ -259,15 +266,36 @@ def query_server(
                 if int(budget_tokens or 0) > 0:
                     think_obj["budget_tokens"] = int(budget_tokens)
                 kwargs["extra_body"] = {"thinking": think_obj}
-            response = llm.client.chat.completions.create(**kwargs)
-            text = ""
-            finish_reason = None
-            if response.choices:
-                c0 = response.choices[0]
-                text = str(getattr(c0.message, "content", "") or "")
-                finish_reason = str(getattr(c0, "finish_reason", "") or "")
-            return _pack(text, finish_reason)
+            from llm_local import consume_chat_completion_stream, llm_streaming_enabled
+            import sys
 
+            _dp = (stream_dump_path or "").strip() or None
+            dumped_to_file = False
+            if llm_streaming_enabled():
+                kwargs["stream"] = True
+                stream = llm.client.chat.completions.create(**kwargs)
+                text, fr, dumped_to_file = consume_chat_completion_stream(stream, _dp)
+                finish_reason = str(fr) if fr else None
+            else:
+                response = llm.client.chat.completions.create(**kwargs)
+                text = ""
+                finish_reason = None
+                if response.choices:
+                    c0 = response.choices[0]
+                    text = str(getattr(c0.message, "content", "") or "")
+                    finish_reason = str(getattr(c0, "finish_reason", "") or "")
+                if _dp:
+                    Path(_dp).write_text(text, encoding="utf-8")
+                    print(
+                        f"\r[llm_output.txt] written: {len(text)} chars",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    print(file=sys.stderr)
+                    dumped_to_file = True
+            return _qs_ret(_pack(text, finish_reason), dumped_to_file)
+
+        _dump = (stream_dump_path or "").strip() or None
         cfg = GenerationConfig(
             max_new_tokens=max_tokens,
             temperature=temperature,
@@ -275,14 +303,15 @@ def query_server(
             top_k=top_k,
             enable_thinking=bool(is_reasoning_model),
             thinking_budget_tokens=int(budget_tokens or 0),
+            stream_dump_path=_dump,
         )
 
-        output = llm.chat(
-            system_prompt,         
+        output, dumped_to_file = llm.chat(
+            system_prompt,
             prompt,
             cfg,
         )
-        return _pack(output, None)
+        return _qs_ret(_pack(output, None), dumped_to_file)
 
     # ------------------ File queue ---------------------
     if server_type == "file_queue":
@@ -308,7 +337,7 @@ def query_server(
             msg_payload.append({"role": role, "content": content})
         content = _file_queue_call(msg_payload, sys_txt)
         text = content[0] if isinstance(content, list) and content else str(content or "")
-        return _pack(text, None)
+        return _qs_ret(_pack(text, None), False)
 
     # ------------------ Cloud APIs ---------------------
     outputs = []
@@ -362,7 +391,7 @@ def query_server(
         except Exception:
             pass
 
-        return _pack(response.text, finish_reason if 'finish_reason' in locals() else None)
+        return _qs_ret(_pack(response.text, finish_reason if 'finish_reason' in locals() else None), False)
 
     elif server_type == "anthropic":
         assert isinstance(prompt, str)
@@ -482,8 +511,8 @@ def query_server(
                     print(f"Warning: Failed to write usage log to {log_path}: {e}")
 
     if len(outputs) == 1:
-        return _pack(outputs[0], finish_reason)
+        return _qs_ret(_pack(outputs[0], finish_reason), False)
     if not return_metadata:
-        return outputs
+        return _qs_ret(outputs, False)
     first = outputs[0] if outputs else ""
-    return {"text": first, "finish_reason": finish_reason}
+    return _qs_ret({"text": first, "finish_reason": finish_reason}, False)

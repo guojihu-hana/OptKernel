@@ -11,8 +11,8 @@ rlaunch --gpu=${GPU_NUM} \
     --charged-group=sys_gpu \
     --mount=gpfs://gpfs1/ailab-sys/guojihu:/mnt/shared-storage-user/ailab-sys/guojihu \
     --mount=gpfs://gpfs2/gpfs2-shared-public:/mnt/shared-storage-gpfs2/gpfs2-shared-public \
-    --image=registry.h.pjlab.org.cn/ailab-sys-sys_gpu/vllm-gjh:glm51-cu129 \
-    --workdir=/mnt/shared-storage-user/ailab-sys/guojihu/CudaForge \
+    --image=registry.h.pjlab.org.cn/ailab-sys-sys_gpu/vllm-gjh:glm51-cu129-ncu-fixed \
+    --workdir=/mnt/shared-storage-user/ailab-sys/guojihu/OptKernel \
     --entrypoint /bin/bash
 
 
