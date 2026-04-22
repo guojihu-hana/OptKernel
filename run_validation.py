@@ -2,12 +2,19 @@
 Reference vs generated kernel forward validation and lightweight timing.
 
 Used by :class:`agent.KernelBenchAgent` after writing ``kernel.py`` for a round.
+The agent calls :func:`run_forward_validation_subprocess` (fresh ``python`` process) so a bad
+generated kernel is less likely to poison the parent’s CUDA context; :func:`run_forward_validation`
+remains available for in-process use (tests, tools).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import subprocess
 import sys
+from subprocess import CompletedProcess
 import time
 import traceback
 from pathlib import Path
@@ -327,3 +334,126 @@ def run_forward_validation(
         "numerical_check": num_info,
         "benchmark_timing": benchmark_timing,
     }
+
+
+def _subprocess_io_capture(
+    proc: CompletedProcess[str], cmd: list[str], *, max_chars: int = 16_000
+) -> dict[str, Any]:
+    """Structured stderr/stdout/cmd/returncode for metrics when a worker dies or misbehaves."""
+    return {
+        "returncode": proc.returncode,
+        "command": cmd,
+        "stderr": (proc.stderr or "")[:max_chars],
+        "stdout": (proc.stdout or "")[:max_chars],
+    }
+
+
+def run_forward_validation_subprocess(
+    task_path: Path,
+    kernel_path: Path,
+    seed: int,
+    atol: float,
+    rtol: float,
+    gen_module_name: str = "kernelbench_generated_uniq",
+) -> dict[str, Any]:
+    """
+    Run :func:`run_forward_validation` in a **fresh Python process** (CUDA isolation from the agent).
+    One JSON object is printed to stdout by the child; this function parses and returns it.
+    If the child exits before valid JSON (crash, OOM, SIGKILL), stderr/stdout are still captured in
+    ``result["subprocess"]`` for :file:`metrics.json`.
+    """
+    root = Path(__file__).resolve().parent
+    script = root / "run_validation.py"
+    cmd: list[str] = [
+        sys.executable,
+        str(script),
+        "forward-validation",
+        "--task-file",
+        str(task_path.resolve()),
+        "--kernel-file",
+        str(kernel_path.resolve()),
+        "--seed",
+        str(seed),
+        "--atol",
+        str(atol),
+        "--rtol",
+        str(rtol),
+        "--gen-module-name",
+        gen_module_name,
+    ]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env=os.environ.copy(),
+    )
+    out = (proc.stdout or "").strip()
+    if not out:
+        cap = _subprocess_io_capture(proc, cmd)
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": (
+                f"validation worker process exited with code {proc.returncode} and no JSON on stdout. "
+                "Check subprocess.stderr in metrics (e.g. tracebacks, OOM, signal)."
+            ),
+            "subprocess": cap,
+        }
+    try:
+        parsed: dict[str, Any] = json.loads(out)
+    except json.JSONDecodeError as e:
+        cap = _subprocess_io_capture(proc, cmd)
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": (
+                f"validation worker: invalid JSON on stdout ({e!s}). "
+                "See subprocess.stderr/stdout in metrics for the raw process output."
+            ),
+            "subprocess": cap,
+        }
+    if proc.returncode not in (0, None):
+        # Worker should exit 0 once it prints; non-zero is unusual — attach diagnostics.
+        parsed = dict(parsed)
+        parsed["subprocess_exit_warning"] = _subprocess_io_capture(proc, cmd)
+    return parsed
+
+
+def _main_forward_validation_worker() -> int:
+    """``python run_validation.py forward-validation --task-file ...`` — prints one JSON object to stdout."""
+    import argparse
+
+    p = argparse.ArgumentParser(description="Isolated run_forward_validation worker (for agent subprocess).")
+    p.add_argument("--task-file", type=Path, required=True)
+    p.add_argument("--kernel-file", type=Path, required=True)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--atol", type=float, default=1e-4)
+    p.add_argument("--rtol", type=float, default=1e-4)
+    p.add_argument("--gen-module-name", type=str, default="kernelbench_generated_uniq")
+    args = p.parse_args()
+    try:
+        result: dict[str, Any] = run_forward_validation(
+            args.task_file.resolve(),
+            args.kernel_file.resolve(),
+            args.seed,
+            args.atol,
+            args.rtol,
+            gen_module_name=args.gen_module_name,
+        )
+    except Exception as e:  # noqa: BLE001 — worker must print JSON
+        result = {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": f"run_forward_validation raised: {e!r}\n{traceback.format_exc()}",
+        }
+    print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "forward-validation":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        raise SystemExit(_main_forward_validation_worker())
+    print("Usage: run_validation.py forward-validation --task-file T --kernel-file K [...]", file=sys.stderr)
+    raise SystemExit(2)

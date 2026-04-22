@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import os
 import subprocess
 import sys
+import traceback
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -402,3 +405,137 @@ def run_ncu_profile(
                 4000,
             )
     return out
+
+
+def run_ncu_profile_subprocess(
+    kernel_path: Path,
+    work_dir: Path,
+    ncu_binary: str,
+    metrics_args: list[str],
+    extra_args: list[str],
+    *,
+    launch_skip: int = SKIP_K,
+    launch_count: int = PROFILE_K,
+) -> dict[str, Any]:
+    """
+    Run :func:`run_ncu_profile` in a **fresh Python process** (isolates the parent agent from
+    the ``ncu``/import pipeline). Child prints one JSON object on stdout.
+    Metric id list is taken from ``metrics_args`` (``--metrics`` joined string), same as
+    :func:`run_ncu_profile`.
+    """
+    root = Path(__file__).resolve().parent
+    script = root / "run_ncu.py"
+    metrics_joined = ""
+    if len(metrics_args) >= 2 and str(metrics_args[0]).strip() == "--metrics":
+        metrics_joined = str(metrics_args[1])
+    cmd: list[str] = [
+        sys.executable,
+        str(script),
+        "ncu-profile",
+        "--kernel-file",
+        str(Path(kernel_path).resolve()),
+        "--work-dir",
+        str(Path(work_dir).resolve()),
+        "--ncu-binary",
+        ncu_binary,
+        "--metrics-joined",
+        metrics_joined,
+        "--extra-json",
+        json.dumps(extra_args),
+        "--launch-skip",
+        str(launch_skip),
+        "--launch-count",
+        str(launch_count),
+    ]
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        env=os.environ.copy(),
+    )
+    out = (proc.stdout or "").strip()
+    if not out:
+        rc = proc.returncode if proc.returncode is not None else -1
+        return {
+            "returncode": rc,
+            "stdout": (proc.stdout or "")[:12_000],
+            "stderr": f"ncu worker: no JSON on stdout. exit={rc}. See subprocess fields.",
+            "subprocess": {
+                "returncode": rc,
+                "command": cmd,
+                "stderr": (proc.stderr or "")[:16_000],
+                "stdout": (proc.stdout or "")[:16_000],
+            },
+        }
+    try:
+        result: dict[str, Any] = json.loads(out)
+    except json.JSONDecodeError as e:
+        rc = proc.returncode if proc.returncode is not None else -1
+        return {
+            "returncode": rc,
+            "stderr": f"ncu worker: invalid JSON ({e!s})",
+            "subprocess": {
+                "returncode": rc,
+                "command": cmd,
+                "stderr": (proc.stderr or "")[:16_000],
+                "stdout": (out[:16_000] if out else (proc.stdout or ""))[:16_000],
+            },
+        }
+    if proc.returncode not in (0, None) and "subprocess_exit_warning" not in result:
+        result = dict(result)
+        result["subprocess_exit_warning"] = {
+            "returncode": proc.returncode,
+            "command": cmd,
+            "stderr": (proc.stderr or "")[:12_000],
+            "stdout": (proc.stdout or "")[:8_000],
+        }
+    return result
+
+
+def _main_ncu_profile_worker() -> int:
+    """``python run_ncu.py ncu-profile --kernel-file ...`` — one JSON on stdout."""
+    import argparse
+
+    p = argparse.ArgumentParser(description="Isolated ncu run_ncu_profile worker (for agent subprocess).")
+    p.add_argument("--kernel-file", type=Path, required=True)
+    p.add_argument("--work-dir", type=Path, required=True)
+    p.add_argument("--ncu-binary", type=str, default="ncu")
+    p.add_argument("--metrics-joined", type=str, default="")
+    p.add_argument("--extra-json", type=str, default="[]")
+    p.add_argument("--launch-skip", type=int, default=SKIP_K)
+    p.add_argument("--launch-count", type=int, default=PROFILE_K)
+    args = p.parse_args()
+    try:
+        names = [x.strip() for x in (args.metrics_joined or "").split(",") if x.strip()]
+        metric_names = effective_ncu_metrics(names)
+        metrics_args = ["--metrics", ",".join(metric_names)]
+        extra: Any = json.loads(args.extra_json or "[]")
+        if not isinstance(extra, list):
+            extra = []
+        extra_s = [str(x) for x in extra]
+        out = run_ncu_profile(
+            args.kernel_file.resolve(),
+            args.work_dir.resolve(),
+            args.ncu_binary,
+            metrics_args,
+            extra_s,
+            metric_names,
+            launch_skip=args.launch_skip,
+            launch_count=args.launch_count,
+        )
+    except Exception as e:  # noqa: BLE001
+        out = {
+            "returncode": -1,
+            "worker_error": f"{e!r}\n{traceback.format_exc()}",
+        }
+    print(json.dumps(out, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "ncu-profile":
+        sys.argv = [sys.argv[0]] + sys.argv[2:]
+        raise SystemExit(_main_ncu_profile_worker())
+    print("Usage: run_ncu.py ncu-profile --kernel-file K --work-dir D [...]", file=sys.stderr)
+    raise SystemExit(2)

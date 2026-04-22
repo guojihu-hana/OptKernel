@@ -60,6 +60,44 @@ def is_max_tokens_truncation(reason: Optional[str]) -> bool:
 # Appended to the user message on max_tokens continuation requests (k > 0) only.
 _CONTINUATION_DIRECT_CODE_SUFFIX = "\n\nNO THINKING, DIRECTLY OUTPUT THE CODE"
 
+# ~bytes of chat template overhead (roles, padding); conservative fudge on top of body tokens.
+_CHAT_FORMAT_OVERHEAD_TOKENS = 8
+
+
+def estimate_chat_prompt_tokens(system_prompt: str, user_text: str) -> int:
+    """
+    Best-effort prompt token count for a single system + one user turn (vLLM/OpenAI chat).
+    Uses ``tiktoken`` (cl100k_base) if installed, else **chars / 2.5** (mixed text heuristic).
+    """
+    sys_t = system_prompt or ""
+    usr_t = user_text or ""
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        return int(len(enc.encode(sys_t)) + len(enc.encode(usr_t)) + _CHAT_FORMAT_OVERHEAD_TOKENS)
+    except Exception:
+        n = len(sys_t) + len(usr_t)
+        return max(1, (n * 2 + 4) // 5 + _CHAT_FORMAT_OVERHEAD_TOKENS)
+
+
+def _completion_max_tokens_capped(
+    request_max: int, system_prompt: str, user_content: str, max_context_length: int
+) -> int:
+    """``min(request_max, max(1, max_context - prompt_tokens))`` when max_context is set."""
+    if max_context_length <= 0:
+        return request_max
+    pt = estimate_chat_prompt_tokens(system_prompt, user_content)
+    room = max_context_length - pt
+    if room < 1:
+        print(
+            f"[llm_local] max_context_length={max_context_length} with ~{pt} est. prompt tokens "
+            f"leaves {room} completion budget — capping to 1; raise --max-context-length or shorten prompt.",
+            file=sys.stderr,
+        )
+    cap = min(request_max, max(1, room))
+    return cap
+
 
 def consume_chat_completion_stream(
     stream: Any,
@@ -142,9 +180,17 @@ def openai_chat_completion_with_truncation_retry(
     max_continuations: int,
     round_idx: Optional[int] = None,
     repetition_penalty: Optional[float] = None,
+    max_context_length: int = 0,
 ) -> tuple[str, Optional[str], bool]:
     """
     Repeat chat.completions until finish_reason is not max_tokens truncation or cap hit.
+
+    The **first** request (``k == 0``) always uses the full ``max_tokens`` (no
+    :func:`_completion_max_tokens_capped`).
+
+    **Continuation** requests (``k > 0``), when ``max_context_length > 0``, cap ``max_tokens``
+    to the remaining room vs. estimated prompt size so the growing user message does not overflow
+    the context window.
 
     Each continuation uses user message ``original_user + accumulated_text`` (single user turn).
     Returns (full_text, last_finish_reason, any_incremental_dump_written).
@@ -162,12 +208,18 @@ def openai_chat_completion_with_truncation_retry(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
+        if k == 0:
+            eff_max = int(max_tokens)
+        else:
+            eff_max = _completion_max_tokens_capped(
+                max_tokens, system_prompt, user_content, max_context_length
+            )
         kwargs: dict[str, Any] = dict(
             model=model,
             messages=messages,
             temperature=temperature,
             top_p=top_p,
-            max_tokens=max_tokens,
+            max_tokens=eff_max,
         )
         if seed is not None:
             kwargs["seed"] = seed
@@ -241,6 +293,8 @@ class GenerationConfig:
     max_continuations: Optional[int] = None
     # Agent round index for [llm_output.txt] stderr progress only (optional).
     round_idx: Optional[int] = None
+    # 0 = disabled; else on **continuation** chat requests only, cap max_tokens to context room.
+    max_context_length: int = 0
 
 
 # -------------------------------
@@ -310,6 +364,7 @@ class LLM:
             max_continuations=max_cont,
             round_idx=cfg.round_idx,
             repetition_penalty=cfg.repetition_penalty,
+            max_context_length=cfg.max_context_length,
         )
         return text, dumped
 

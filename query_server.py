@@ -73,6 +73,7 @@ def query_server(
     stream_dump_path: Optional[str] = None,
     openai_compatible_api_key: str = "",
     repetition_penalty: float = 1.00,
+    max_context_length: int = 0,
 ):
     system_prompt = _merge_concise_system_instruction(system_prompt)
     match server_type:
@@ -294,6 +295,7 @@ def query_server(
                 max_continuations=max_cont,
                 round_idx=round_idx,
                 repetition_penalty=repetition_penalty,
+                max_context_length=int(max_context_length or 0),
             )
             return _qs_ret(_pack(text, finish_reason), dumped_to_file)
 
@@ -308,6 +310,7 @@ def query_server(
             thinking_budget_tokens=int(budget_tokens or 0),
             stream_dump_path=_dump,
             round_idx=round_idx,
+            max_context_length=int(max_context_length or 0),
         )
 
         output, dumped_to_file = llm.chat(

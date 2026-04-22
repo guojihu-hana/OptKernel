@@ -7,22 +7,12 @@ Does not run run_validation.run_forward_validation, ncu, or the real query_serve
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-# agent.py imports query_server; stub before loading agent to avoid agents.llm_local dependency.
-if "query_server" not in sys.modules:
-    _stub = types.ModuleType("query_server")
-
-    def _stub_query_server(*_a, **_kw) -> str:
-        raise RuntimeError("call_llm is mocked in tests; query_server must not be called")
-
-    _stub.query_server = _stub_query_server
-    sys.modules["query_server"] = _stub
+# call_llm is mocked in tests; the real path uses run_llm_subprocess (child + query_server).
 
 from agent import AgentConfig, KernelBenchAgent, extract_python_module, parse_args
 
@@ -65,7 +55,7 @@ class TestRunRoundLlmOnly(unittest.TestCase):
         def fake_call_llm(self_: KernelBenchAgent, system: str, user: str, round_idx: int, *_a, **_kw):
             self.assertIn(REF_SNIPPET, user)
             self.assertIn("CUDA", system)
-            return FAKE_KERNEL, False
+            return {"ok": True, "text": FAKE_KERNEL, "llm_output_dumped": False}
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
@@ -95,7 +85,7 @@ class TestRunRoundLlmOnly(unittest.TestCase):
         def fake_call_llm(
             self_: KernelBenchAgent, system: str, user: str, round_idx: int, *_a, **_kw
         ):
-            return "no code fence here, only prose", False
+            return {"ok": True, "text": "no code fence here, only prose", "llm_output_dumped": False}
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
@@ -108,6 +98,30 @@ class TestRunRoundLlmOnly(unittest.TestCase):
         self.assertFalse((rd / "kernel.py").exists())
         data = json.loads((rd / "metrics.json").read_text(encoding="utf-8"))
         self.assertEqual(data["status"], "parse_error")
+
+    def test_llm_subprocess_error_writes_metrics(self) -> None:
+        def fake_call_llm(
+            self_: KernelBenchAgent, system: str, user: str, round_idx: int, *_a, **_kw
+        ) -> dict:
+            return {
+                "ok": False,
+                "runtime_error": "connection reset",
+                "subprocess": {"returncode": 1, "command": ["python"], "stderr": "e", "stdout": ""},
+            }
+
+        agent = KernelBenchAgent(self.cfg)
+        with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
+            out = agent.run_round_llm_only(0)
+
+        self.assertEqual(out.get("status"), "llm_subprocess_error")
+        self.assertFalse(out.get("runnable"))
+        rd = self.work_dir / "round_000"
+        self.assertTrue((rd / "metrics.json").is_file())
+        self.assertEqual(out["llm"]["runtime_error"], "connection reset")
+        data = json.loads((rd / "metrics.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["status"], "llm_subprocess_error")
+        self.assertIn("llm", data)
+        self.assertIn("subprocess", data["llm"])
 
     def test_round1_includes_previous_kernel_in_user_prompt(self) -> None:
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -124,7 +138,7 @@ class TestRunRoundLlmOnly(unittest.TestCase):
         def fake_call_llm(self_: KernelBenchAgent, system: str, user: str, round_idx: int, *_a, **_kw):
             captured["user"] = user
             self.assertEqual(round_idx, 1)
-            return FAKE_KERNEL, False
+            return {"ok": True, "text": FAKE_KERNEL, "llm_output_dumped": False}
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):

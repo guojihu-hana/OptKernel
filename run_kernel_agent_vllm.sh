@@ -111,5 +111,6 @@ python3 "${SCRIPT_DIR}/agent.py" --server-type vllm \
   --server-port "${SERVER_PORT}" \
   --max-rounds 100 \
   --max-tokens 90000 \
+  --max-context-length 190000 \
   --api-key "${VLLM_API_KEY}" \
   "${AGENT_ARGS[@]}"

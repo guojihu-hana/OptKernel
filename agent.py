@@ -1,5 +1,6 @@
 """
-KernelBench CUDA rewrite agent: multi-round LLM -> kernel.py -> run_validation -> ncu.
+KernelBench CUDA rewrite agent: multi-round LLM (``run_llm`` subprocess) -> kernel.py
+-> run_validation -> ncu.
 
 Per round under work_dir/round_{k:03d}/: kernel.py, prompt.txt, llm_output.txt, metrics.json.
 Default work_dir (if --work-dir omitted): ./runs/<YYYYMMDDHHMMSS>/<task_file_stem>/.
@@ -15,8 +16,8 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
-import traceback
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,7 +27,7 @@ from typing import Any, Optional, Set
 # LLM
 # -----------------------------------------------------------------------------
 
-from query_server import query_server
+from run_llm import run_llm_subprocess
 
 
 def _utc_iso() -> str:
@@ -48,9 +49,9 @@ from run_ncu import (
     SKIP_K,
     effective_ncu_metrics,
     nccu_bin,
-    run_ncu_profile,
+    run_ncu_profile_subprocess,
 )
-from run_validation import run_forward_validation
+from run_validation import run_forward_validation_subprocess
 
 # -----------------------------------------------------------------------------
 # Extract ```python``` from LLM output
@@ -107,6 +108,8 @@ class AgentConfig:
     model_name: str = "GLM-5.1-FP8"
     temperature: float = 0.1
     max_tokens: int = 16384
+    # 0 = disabled. Else cap max_tokens on LLM continuation rounds only (see llm_local).
+    max_context_length: int = 0
     # Thinking / reasoning API (see query_server is_reasoning_model). Default: on.
     reasoning_enabled: bool = True
     """If set, only these round indices use reasoning; all others do not."""
@@ -157,39 +160,67 @@ class KernelBenchAgent:
         user: str,
         round_idx: int,
         llm_output_path: Optional[Path] = None,
-    ) -> tuple[str, bool]:
-        """Returns (completion_text, llm_output_already_written_to_disk)."""
+    ) -> dict[str, Any]:
+        """
+        Single LLM call via a child process (see :func:`run_llm.run_llm_subprocess`).
+
+        On success: ``{"ok": true, "text", "llm_output_dumped"}``.
+
+        On failure: the child/parent result dict (``ok: false`` plus ``runtime_error`` and
+        often ``subprocess`` with command/stderr/stdout) so the agent can store it in
+        ``metrics.json``, same style as validation/ncu.
+        """
         c = self.config
-        raw, llm_dumped = query_server(
-            user,
-            system_prompt=system,
-            temperature=c.temperature,
-            max_tokens=c.max_tokens,
-            server_type=c.server_type,
-            server_address=c.server_address,
-            server_port=c.server_port,
-            model_name=c.model_name,
-            is_reasoning_model=self.reasoning_for_round(round_idx),
-            call_type="kernel_bench_agent",
-            round_idx=round_idx,
-            stream_dump_path=str(llm_output_path) if llm_output_path else None,
-            openai_compatible_api_key=c.openai_compatible_api_key,
-            repetition_penalty=c.repetition_penalty,
-        )
-        if isinstance(raw, dict):
-            return str(raw.get("text", "")), llm_dumped
-        if isinstance(raw, list):
-            return (str(raw[0]) if raw else ""), llm_dumped
-        return str(raw or ""), llm_dumped
+        tmp: Any = None
+        if llm_output_path is not None:
+            in_dir = llm_output_path.parent
+            in_dir.mkdir(parents=True, exist_ok=True)
+            sys_p = in_dir / "_llm_subproc_system.txt"
+            usr_p = in_dir / "_llm_subproc_user.txt"
+        else:
+            tmp = tempfile.TemporaryDirectory()
+            p = Path(tmp.name)
+            sys_p = p / "system.txt"
+            usr_p = p / "user.txt"
+        try:
+            sys_p.write_text(system, encoding="utf-8")
+            usr_p.write_text(user, encoding="utf-8")
+            res = run_llm_subprocess(
+                sys_p,
+                usr_p,
+                round_idx,
+                llm_output_path,
+                temperature=c.temperature,
+                max_tokens=c.max_tokens,
+                server_type=c.server_type,
+                server_address=c.server_address,
+                server_port=c.server_port,
+                model_name=c.model_name,
+                is_reasoning_model=self.reasoning_for_round(round_idx),
+                openai_compatible_api_key=c.openai_compatible_api_key,
+                repetition_penalty=c.repetition_penalty,
+                max_context_length=c.max_context_length,
+            )
+        finally:
+            if tmp is not None:
+                tmp.cleanup()
+        if res.get("ok"):
+            return {
+                "ok": True,
+                "text": str(res.get("text", "")),
+                "llm_output_dumped": bool(res.get("llm_output_dumped", False)),
+            }
+        return res
 
     def run_round_llm_only(self, round_idx: int) -> dict[str, Any]:
         """
         Task (from init), build prompt, call LLM, extract ```python```, write
         ``prompt.txt``, ``llm_output.txt``, and ``kernel.py`` if extraction succeeds.
 
-        If parsing fails, writes ``metrics.json`` and returns a **final** result dict
-        (``status: parse_error``). Otherwise returns a partial dict without
-        ``run_validation.run_forward_validation`` / ncu; :meth:`run_round` continues from there.
+        If the LLM subprocess fails, writes ``metrics.json`` with
+        ``status: llm_subprocess_error`` and a ``llm`` payload (``runtime_error``, ``subprocess``).
+        If parsing fails, writes ``metrics.json`` and returns ``status: parse_error``.
+        Otherwise returns a partial dict without validation/ncu; :meth:`run_round` continues from there.
         """
         c = self.config
         rd = self.round_dir(round_idx)
@@ -235,7 +266,7 @@ class KernelBenchAgent:
 
         ll_t0 = time.perf_counter()
         ll_ts0 = _utc_iso()
-        llm_raw, llm_written = self.call_llm(system, user, round_idx, llm_out_path)
+        llm_res = self.call_llm(system, user, round_idx, llm_out_path)
         ll_t1 = time.perf_counter()
         ll_ts1 = _utc_iso()
         llm_eval_timing = {
@@ -243,11 +274,27 @@ class KernelBenchAgent:
             "finished_at": ll_ts1,
             "seconds": round(ll_t1 - ll_t0, 6),
         }
+        if not llm_res.get("ok"):
+            base: dict[str, Any] = {
+                "round": round_idx,
+                "task_path": str(c.task_path.resolve()),
+                "work_dir": str(rd.resolve()),
+                "model_name": c.model_name,
+                "runnable": False,
+                "status": "llm_subprocess_error",
+                "llm": llm_res,
+                "eval_timing": {"llm": llm_eval_timing},
+            }
+            self.write_metrics(metrics_path, base)
+            return base
+
+        llm_raw = str(llm_res.get("text", ""))
+        llm_written = bool(llm_res.get("llm_output_dumped", False))
         if not llm_written:
             llm_out_path.write_text(llm_raw, encoding="utf-8")
 
         py_src = extract_python_module(llm_raw)
-        base: dict[str, Any] = {
+        base = {
             "round": round_idx,
             "task_path": str(c.task_path.resolve()),
             "work_dir": str(rd.resolve()),
@@ -276,32 +323,22 @@ class KernelBenchAgent:
         metrics_path = rd / "metrics.json"
 
         base = self.run_round_llm_only(round_idx)
-        if base.get("status") == "parse_error":
+        if base.get("status") in ("parse_error", "llm_subprocess_error"):
             return base
 
         gen_mod_name = f"kernelbench_generated_r{round_idx}"
         eval_timing: dict[str, Any] = dict(base.get("eval_timing") or {})
         v_t0 = time.perf_counter()
         v_ts0 = _utc_iso()
-        try:
-            val = run_forward_validation(
-                c.task_path,
-                kernel_path,
-                seed=c.seed,
-                atol=c.atol,
-                rtol=c.rtol,
-                gen_module_name=gen_mod_name,
-            )
-        except Exception as exc:
-            val = {
-                "runnable": False,
-                "status": "runtime_error",
-                "runtime_error": (
-                    f"run_forward_validation raised {type(exc).__name__}: {exc}\n"
-                    f"(includes CUDA/PTX/Accelerator errors that escaped internal handlers.)\n"
-                    f"{traceback.format_exc()}"
-                ),
-            }
+        # Fresh Python process per round: CUDA / native crashes do not take down the LLM agent.
+        val = run_forward_validation_subprocess(
+            c.task_path,
+            kernel_path,
+            seed=c.seed,
+            atol=c.atol,
+            rtol=c.rtol,
+            gen_module_name=gen_mod_name,
+        )
         v_t1 = time.perf_counter()
         v_ts1 = _utc_iso()
         eval_timing["validation"] = {
@@ -323,13 +360,12 @@ class KernelBenchAgent:
 
             n_t0 = time.perf_counter()
             n_ts0 = _utc_iso()
-            ncu_info = run_ncu_profile(
+            ncu_info = run_ncu_profile_subprocess(
                 kernel_path,
                 rd,
                 c.ncu_binary,
                 metrics_args,
                 c.ncu_extra_args,
-                metric_names,
                 launch_skip=c.ncu_launch_skip,
                 launch_count=c.ncu_launch_count,
             )
@@ -428,6 +464,14 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         ),
     )
     p.add_argument("--max-tokens", type=int, default=32768)
+    p.add_argument(
+        "--max-context-length",
+        type=int,
+        default=0,
+        help="Model context window (0 = off). On LLM continuation requests only (after length truncation, k>0), "
+        "cap output tokens to min(--max-tokens, max_context_length - estimated prompt tokens). "
+        "The first completion uses full --max-tokens.",
+    )
     p.add_argument("--temperature", type=float, default=0.1)
     p.add_argument(
         "--repetition-penalty",
@@ -526,6 +570,8 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         p.error("--start-round must be >= 0")
     if args.start_round >= args.max_rounds:
         p.error("--start-round must be < --max-rounds (run range is [start-round, max-rounds))")
+    if int(args.max_context_length or 0) < 0:
+        p.error("--max-context-length must be >= 0 (0 = disabled)")
 
     return AgentConfig(
         task_path=task_path,
@@ -541,6 +587,7 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         server_port=args.server_port,
         model_name=args.model,
         max_tokens=args.max_tokens,
+        max_context_length=int(args.max_context_length or 0),
         temperature=args.temperature,
         reasoning_enabled=not args.no_reasoning,
         reasoning_only_rounds=only,
