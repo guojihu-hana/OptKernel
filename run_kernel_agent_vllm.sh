@@ -29,22 +29,52 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-SERVER_ADDRESS="${SERVER_ADDRESS:-10.102.215.76}"
+SERVER_ADDRESS="${SERVER_ADDRESS:-10.102.207.7}"
 SERVER_PORT="${SERVER_PORT:-8000}"
-# Must match vLLM --served-model-name. This script always passes --model to agent.py.
-# - Override: export MODEL_NAME=... before running, OR pass --model ... again on the CLI
-#   (argparse uses the *last* --model; this line comes first, so a trailing --model wins).
-# - If you only assign MODEL_NAME=foo on a previous line without export, child shells
-#   do not see it; use: export MODEL_NAME=foo  OR  MODEL_NAME=foo ./run_kernel_agent_vllm.sh ...
-MODEL_NAME="${MODEL_NAME:-${KERNEL_AGENT_MODEL:-MiniMax-M2.5}}"
 VLLM_API_KEY="${VLLM_API_KEY:-DONOTATTACKMYVLLM}"
+
+# Must match vLLM --served-model-name. This script passes --model to agent.py.
+# - If MODEL_NAME is unset: GET http://SERVER:PORT/v1/models (with Bearer API_KEY) and use
+#   the first model id; on failure fall back to KERNEL_AGENT_MODEL or MiniMax-M2.5.
+# - If MODEL_NAME is set (export ...): that value is kept.
+# - CLI: pass --model ... in "$@"; argparse keeps the *last* --model.
+if [[ -z "${MODEL_NAME:-}" ]]; then
+  if MODEL_CAND="$(
+    BASE_URL="http://${SERVER_ADDRESS}:${SERVER_PORT}" API_KEY="${VLLM_API_KEY}" python3 -c '
+import json, os, sys, urllib.request
+base = os.environ.get("BASE_URL", "").rstrip("/")
+key = os.environ.get("API_KEY", "")
+req = urllib.request.Request(base + "/v1/models")
+if key:
+    req.add_header("Authorization", "Bearer " + key)
+with urllib.request.urlopen(req, timeout=30) as resp:
+    d = json.load(resp)
+rows = d.get("data") or []
+if not rows:
+    sys.exit(1)
+m = rows[0]
+for k in ("id", "root", "model"):
+    v = m.get(k)
+    if isinstance(v, str) and v.strip():
+        print(v.strip())
+        break
+else:
+    sys.exit(1)
+'
+  )"; then
+    MODEL_NAME="${MODEL_CAND}"
+  else
+    MODEL_NAME="${KERNEL_AGENT_MODEL:-MiniMax-M2.5}"
+    echo "run_kernel_agent_vllm.sh: could not list models from \${SERVER_ADDRESS}:\${SERVER_PORT}; using MODEL_NAME=${MODEL_NAME}" >&2
+  fi
+fi
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
 
 # Accelerate Assembling
 export MAX_JOBS=$(nproc)
 export TORCH_CUDA_ARCH_LIST="9.0"
 
-exec python "${SCRIPT_DIR}/agent.py" --server-type vllm \
+python3 "${SCRIPT_DIR}/agent.py" --server-type vllm \
   --model "${MODEL_NAME}" \
   --server-address "${SERVER_ADDRESS}" \
   --server-port "${SERVER_PORT}" \

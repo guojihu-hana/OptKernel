@@ -243,6 +243,7 @@ class KernelBenchAgent:
             "round": round_idx,
             "task_path": str(c.task_path.resolve()),
             "work_dir": str(rd.resolve()),
+            "model_name": c.model_name,
             "eval_timing": {"llm": llm_eval_timing},
         }
 
