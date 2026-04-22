@@ -72,6 +72,7 @@ def query_server(
     return_metadata: bool = False,
     stream_dump_path: Optional[str] = None,
     openai_compatible_api_key: str = "",
+    repetition_penalty: float = 1.00,
 ):
     system_prompt = _merge_concise_system_instruction(system_prompt)
     match server_type:
@@ -292,6 +293,7 @@ def query_server(
                 dump_path=_dp,
                 max_continuations=max_cont,
                 round_idx=round_idx,
+                repetition_penalty=repetition_penalty,
             )
             return _qs_ret(_pack(text, finish_reason), dumped_to_file)
 
@@ -301,6 +303,7 @@ def query_server(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            repetition_penalty=repetition_penalty,
             enable_thinking=bool(is_reasoning_model),
             thinking_budget_tokens=int(budget_tokens or 0),
             stream_dump_path=_dump,

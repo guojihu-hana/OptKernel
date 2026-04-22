@@ -57,6 +57,10 @@ def is_max_tokens_truncation(reason: Optional[str]) -> bool:
     return ru == "MAX_TOKENS" or rl in ("length", "max_tokens")
 
 
+# Appended to the user message on max_tokens continuation requests (k > 0) only.
+_CONTINUATION_DIRECT_CODE_SUFFIX = "\n\nNO THINKING, DIRECTLY OUTPUT THE CODE"
+
+
 def consume_chat_completion_stream(
     stream: Any,
     dump_path: Optional[str] = None,
@@ -137,6 +141,7 @@ def openai_chat_completion_with_truncation_retry(
     dump_path: Optional[str],
     max_continuations: int,
     round_idx: Optional[int] = None,
+    repetition_penalty: Optional[float] = None,
 ) -> tuple[str, Optional[str], bool]:
     """
     Repeat chat.completions until finish_reason is not max_tokens truncation or cap hit.
@@ -151,6 +156,8 @@ def openai_chat_completion_with_truncation_retry(
 
     for k in range(eff_max_cont + 1):
         user_content = original_user + accumulated
+        if k > 0:
+            user_content = user_content + _CONTINUATION_DIRECT_CODE_SUFFIX
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -164,8 +171,11 @@ def openai_chat_completion_with_truncation_retry(
         )
         if seed is not None:
             kwargs["seed"] = seed
-        if extra_body is not None:
-            kwargs["extra_body"] = extra_body
+        eb: Optional[dict[str, Any]] = extra_body
+        if repetition_penalty is not None:
+            eb = {**(eb or {}), "repetition_penalty": repetition_penalty}
+        if eb is not None:
+            kwargs["extra_body"] = eb
 
         if use_stream:
             kwargs["stream"] = True
@@ -299,6 +309,7 @@ class LLM:
             dump_path=dump,
             max_continuations=max_cont,
             round_idx=cfg.round_idx,
+            repetition_penalty=cfg.repetition_penalty,
         )
         return text, dumped
 

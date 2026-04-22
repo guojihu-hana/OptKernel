@@ -3,6 +3,8 @@ KernelBench CUDA rewrite agent: multi-round LLM -> kernel.py -> run_validation -
 
 Per round under work_dir/round_{k:03d}/: kernel.py, prompt.txt, llm_output.txt, metrics.json.
 Default work_dir (if --work-dir omitted): ./runs/<YYYYMMDDHHMMSS>/<task_file_stem>/.
+Resume: pass the same --task-file and an existing --work-dir, then --start-round <k> (0-based);
+round_{k-1} should exist so round k can build the prior-kernel prompt (see run_round_llm_only).
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import re
 import shutil
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -91,6 +94,8 @@ def extract_python_module(text: str) -> Optional[str]:
 class AgentConfig:
     task_path: Path
     work_dir: Path
+    # First round index (0-based); run() uses for r in range(start_round, max_rounds).
+    start_round: int = 0
     max_rounds: int = 5
     stop_on_success: bool = False
     seed: int = 0
@@ -116,6 +121,8 @@ class AgentConfig:
     ncu_launch_count: int = PROFILE_K
     # Bearer for OpenAI-compatible servers (local/vllm); required there via CLI --api-key.
     openai_compatible_api_key: str = ""
+    # vLLM extra_body.repetition_penalty; default 1.1 for MiniMax, else 1.0 (see parse_args).
+    repetition_penalty: float = 1.0
 
 
 class KernelBenchAgent:
@@ -167,6 +174,7 @@ class KernelBenchAgent:
             round_idx=round_idx,
             stream_dump_path=str(llm_output_path) if llm_output_path else None,
             openai_compatible_api_key=c.openai_compatible_api_key,
+            repetition_penalty=c.repetition_penalty,
         )
         if isinstance(raw, dict):
             return str(raw.get("text", "")), llm_dumped
@@ -275,14 +283,25 @@ class KernelBenchAgent:
         eval_timing: dict[str, Any] = dict(base.get("eval_timing") or {})
         v_t0 = time.perf_counter()
         v_ts0 = _utc_iso()
-        val = run_forward_validation(
-            c.task_path,
-            kernel_path,
-            seed=c.seed,
-            atol=c.atol,
-            rtol=c.rtol,
-            gen_module_name=gen_mod_name,
-        )
+        try:
+            val = run_forward_validation(
+                c.task_path,
+                kernel_path,
+                seed=c.seed,
+                atol=c.atol,
+                rtol=c.rtol,
+                gen_module_name=gen_mod_name,
+            )
+        except Exception as exc:
+            val = {
+                "runnable": False,
+                "status": "runtime_error",
+                "runtime_error": (
+                    f"run_forward_validation raised {type(exc).__name__}: {exc}\n"
+                    f"(includes CUDA/PTX/Accelerator errors that escaped internal handlers.)\n"
+                    f"{traceback.format_exc()}"
+                ),
+            }
         v_t1 = time.perf_counter()
         v_ts1 = _utc_iso()
         eval_timing["validation"] = {
@@ -347,7 +366,7 @@ class KernelBenchAgent:
         c = self.config
         c.work_dir.mkdir(parents=True, exist_ok=True)
 
-        for r in range(c.max_rounds):
+        for r in range(c.start_round, c.max_rounds):
             m = self.run_round(r)
             results.append(m)
             if c.stop_on_success and m.get("status") == "success":
@@ -371,7 +390,20 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         help="Output root (rounds go under work_dir/round_{k:03d}/). "
         "If omitted: ./runs/<YYYYMMDDHHMMSS>/<task_file_stem>/ using current time and --task-file basename.",
     )
-    p.add_argument("--max-rounds", type=int, default=5)
+    p.add_argument(
+        "--start-round",
+        type=int,
+        default=0,
+        help="0-based first round to run, for resuming in an existing --work-dir. "
+        "Runs r in [start-round, max-rounds). Requires round_{start-1} when start-round > 0 "
+        "(e.g. start 4 needs .../round_003/ for the previous-kernel prompt).",
+    )
+    p.add_argument(
+        "--max-rounds",
+        type=int,
+        default=5,
+        help="Exclusive end of round indices: runs r in [start-round, max-rounds) (default 5 → rounds 0–4).",
+    )
     p.add_argument("--stop-on-success", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--atol", type=float, default=1e-4)
@@ -397,6 +429,13 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     )
     p.add_argument("--max-tokens", type=int, default=32768)
     p.add_argument("--temperature", type=float, default=0.1)
+    p.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="vLLM sampling repetition_penalty (sent in extra_body). "
+        "If omitted: 1.1 when --model name contains 'MiniMax' (case-insensitive), else 1.0.",
+    )
     p.add_argument("--no-ncu", action="store_true", help="Skip ncu profiling")
     p.add_argument(
         "--ncu-metrics",
@@ -473,9 +512,25 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     only = _parse_round_set(args.reasoning_only_rounds)
     exc = _parse_round_set(args.reasoning_except_rounds)
 
+    def _default_repetition_penalty(model: str) -> float:
+        if "minimax" in (model or "").lower():
+            return 1.1
+        return 1.0
+
+    if args.repetition_penalty is not None:
+        _rep = args.repetition_penalty
+    else:
+        _rep = _default_repetition_penalty(args.model)
+
+    if args.start_round < 0:
+        p.error("--start-round must be >= 0")
+    if args.start_round >= args.max_rounds:
+        p.error("--start-round must be < --max-rounds (run range is [start-round, max-rounds))")
+
     return AgentConfig(
         task_path=task_path,
         work_dir=work_dir,
+        start_round=args.start_round,
         max_rounds=args.max_rounds,
         stop_on_success=args.stop_on_success,
         seed=args.seed,
@@ -497,6 +552,7 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         ncu_launch_skip=args.ncu_launch_skip,
         ncu_launch_count=args.ncu_launch_count,
         openai_compatible_api_key=_api_key,
+        repetition_penalty=_rep,
     )
 
 
@@ -507,6 +563,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     agent = KernelBenchAgent(cfg)
+    if cfg.start_round > 0:
+        print(
+            f"Resuming: rounds {cfg.start_round}..{cfg.max_rounds - 1} under {cfg.work_dir}",
+            file=sys.stderr,
+        )
     agent.run()
     print(f"Done. Artifacts under {cfg.work_dir}")
     return 0

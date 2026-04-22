@@ -19,6 +19,8 @@
   #   --work-dir ./runs/kgen_vllm \
   #   --max-rounds 3 \
   #   --no-ncu
+#   # Resume (same task file + work_dir): --start-round 4 --max-rounds 100  → rounds 4..99
+#   # GPUs: optional --gpu-idx 0  or  --gpu-idx 0,1  (overrides \${CUDA_VISIBLE_DEVICES}; else default 4)
 #   # Thinking/reasoning: default ON. Examples:
 #   #   --no-reasoning
 #   #   --reasoning-except-rounds 1,2
@@ -29,7 +31,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-SERVER_ADDRESS="${SERVER_ADDRESS:-10.102.207.7}"
+SERVER_ADDRESS="${SERVER_ADDRESS:-10.102.97.49}"
 SERVER_PORT="${SERVER_PORT:-8000}"
 VLLM_API_KEY="${VLLM_API_KEY:-DONOTATTACKMYVLLM}"
 
@@ -68,7 +70,36 @@ else:
     echo "run_kernel_agent_vllm.sh: could not list models from \${SERVER_ADDRESS}:\${SERVER_PORT}; using MODEL_NAME=${MODEL_NAME}" >&2
   fi
 fi
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
+
+# Script-only: --gpu-idx N | N,N,... — remaining args go to agent.py
+AGENT_ARGS=()
+_got_gpu_flag=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --gpu-idx)
+      if [[ -z "${2:-}" ]]; then
+        echo "run_kernel_agent_vllm.sh: --gpu-idx requires a value (e.g. 0 or 0,1)" >&2
+        exit 1
+      fi
+      export CUDA_VISIBLE_DEVICES="$2"
+      _got_gpu_flag=true
+      shift 2
+      ;;
+    --gpu-idx=*)
+      export CUDA_VISIBLE_DEVICES="${1#*=}"
+      _got_gpu_flag=true
+      shift
+      ;;
+    *)
+      AGENT_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ "${_got_gpu_flag}" == false ]]; then
+  export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
+fi
 
 # Accelerate Assembling
 export MAX_JOBS=$(nproc)
@@ -79,6 +110,6 @@ python3 "${SCRIPT_DIR}/agent.py" --server-type vllm \
   --server-address "${SERVER_ADDRESS}" \
   --server-port "${SERVER_PORT}" \
   --max-rounds 100 \
-  --max-tokens 65536 \
+  --max-tokens 90000 \
   --api-key "${VLLM_API_KEY}" \
-  "$@"
+  "${AGENT_ARGS[@]}"

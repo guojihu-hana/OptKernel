@@ -90,8 +90,12 @@ def compare_outputs(
                 "dtype_ref": str(out_ref.dtype),
                 "dtype_gen": str(out_gen.dtype),
             }
-        diff = (out_ref.float() - out_gen.float()).abs().max().item()
-        ok = torch.allclose(out_ref, out_gen, atol=atol, rtol=rtol)
+        # Compare on CPU: avoids extra GPU elementwise kernels; misaligned/illegal access from a
+        # bad generated kernel often surfaces on the *next* CUDA op (previously the subtract here).
+        a = out_ref.detach().float().cpu()
+        b = out_gen.detach().float().cpu()
+        diff = (a - b).abs().max().item()
+        ok = torch.allclose(a, b, atol=atol, rtol=rtol)
         return ok, {
             "max_abs_diff": float(diff),
             "atol": atol,
@@ -253,6 +257,9 @@ def run_forward_validation(
         else:
             out_ref = model_ref(inputs_device)
             out_gen = model_gen(inputs_device)
+        # Flush async CUDA work so bad generated kernels fail here, not on the next op (e.g. compare_outputs).
+        if torch.cuda.is_available() and device.type == "cuda":
+            torch.cuda.synchronize()
     except Exception:
         return {
             "runnable": False,
@@ -260,7 +267,18 @@ def run_forward_validation(
             "runtime_error": f"Forward pass failed:\n{traceback.format_exc()}",
         }
 
-    ok, num_info = compare_outputs(out_ref, out_gen, atol, rtol)
+    try:
+        ok, num_info = compare_outputs(out_ref, out_gen, atol, rtol)
+    except Exception:
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": (
+                "Output comparison or host copy (.cpu()) failed—often a deferred CUDA error from the "
+                "generated model forward, or a poisoned context. See traceback; try CUDA_LAUNCH_BLOCKING=1.\n"
+                f"{traceback.format_exc()}"
+            ),
+        }
     if not ok:
         return {
             "runnable": False,

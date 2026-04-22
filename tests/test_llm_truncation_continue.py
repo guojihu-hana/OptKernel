@@ -8,6 +8,7 @@ from typing import Any, Optional
 import pytest
 
 from llm_local import (
+    _CONTINUATION_DIRECT_CODE_SUFFIX,
     consume_chat_completion_stream,
     is_max_tokens_truncation,
     openai_chat_completion_with_truncation_retry,
@@ -134,7 +135,9 @@ def test_openai_truncation_retry_two_stream_rounds(monkeypatch: pytest.MonkeyPat
     assert not dumped
     assert client._completions.call_count == 2
     assert client._completions.last_kwargs[0]["messages"][1]["content"] == "U0"
-    assert client._completions.last_kwargs[1]["messages"][1]["content"] == "U0part1"
+    assert client._completions.last_kwargs[1]["messages"][1]["content"] == (
+        "U0part1" + _CONTINUATION_DIRECT_CODE_SUFFIX
+    )
 
 
 def test_openai_truncation_retry_respects_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
