@@ -16,18 +16,25 @@ import os
 import re
 import shutil
 import sys
-import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Set
+from typing import Any, Optional, Set, Tuple
 
 # -----------------------------------------------------------------------------
 # LLM
 # -----------------------------------------------------------------------------
 
 from run_llm import run_llm_subprocess
+
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _llm_subproc_staging_dir() -> Path:
+    """Scratch for ``run_llm`` file inputs: ``<repo>/temp/llm_subproc/``; each call uses a subdir, deleted after."""
+    return _REPO_ROOT / "temp" / "llm_subproc"
 
 
 def _utc_iso() -> str:
@@ -38,8 +45,11 @@ def _utc_iso() -> str:
 # -----------------------------------------------------------------------------
 
 from build_prompts import (
+    best_round_tuple_for_prompt,
     build_user_prompt_round0,
     build_user_prompt_roundk,
+    find_best_previous_round,
+    speedup_from_metrics,
     summarize_metrics_for_prompt,
     system_prompt_round0,
     system_prompt_roundk,
@@ -132,6 +142,27 @@ class KernelBenchAgent:
     def __init__(self, config: AgentConfig):
         self.config = config
         self._reference_source = config.task_path.read_text(encoding="utf-8")
+        # Best (round_index, speedup) by ``benchmark_timing.speedup``; in-memory only.
+        # If resuming, :meth:`run` may seed with one ``find_best_previous_round`` call.
+        self._best_by_speedup: Optional[Tuple[int, float]] = None
+
+    def _current_best_for_prompt(self, work_dir: Path, current_round: int) -> Optional[Tuple[int, float, str, str]]:
+        t = self._best_by_speedup
+        if t is None or t[0] >= current_round:
+            return None
+        return best_round_tuple_for_prompt(work_dir, t[0], t[1])
+
+    def _update_best_from_metrics(self, round_idx: int, base: dict[str, Any]) -> None:
+        if not base.get("runnable"):
+            return
+        sp = speedup_from_metrics(base)
+        if sp is None:
+            return
+        t = self._best_by_speedup
+        o_r, o_sp = (t[0], t[1]) if t is not None else (-1, float("-inf"))
+        if not (sp > o_sp or (sp == o_sp and round_idx > o_r)):
+            return
+        self._best_by_speedup = (round_idx, sp)
 
     def reasoning_for_round(self, round_idx: int) -> bool:
         """Whether to enable thinking/reasoning for this round (query_server flag)."""
@@ -171,18 +202,17 @@ class KernelBenchAgent:
         ``metrics.json``, same style as validation/ncu.
         """
         c = self.config
-        tmp: Any = None
         if llm_output_path is not None:
-            in_dir = llm_output_path.parent
-            in_dir.mkdir(parents=True, exist_ok=True)
-            sys_p = in_dir / "_llm_subproc_system.txt"
-            usr_p = in_dir / "_llm_subproc_user.txt"
-        else:
-            tmp = tempfile.TemporaryDirectory()
-            p = Path(tmp.name)
-            sys_p = p / "system.txt"
-            usr_p = p / "user.txt"
+            llm_output_path.parent.mkdir(parents=True, exist_ok=True)
+        res: dict[str, Any] = {}
+        work: Optional[Path] = None
+        staging = _llm_subproc_staging_dir()
+        staging.mkdir(parents=True, exist_ok=True)
+        work = staging / uuid.uuid4().hex
         try:
+            work.mkdir(parents=True, exist_ok=True)
+            sys_p = work / "system.txt"
+            usr_p = work / "user.txt"
             sys_p.write_text(system, encoding="utf-8")
             usr_p.write_text(user, encoding="utf-8")
             res = run_llm_subprocess(
@@ -202,8 +232,8 @@ class KernelBenchAgent:
                 max_context_length=c.max_context_length,
             )
         finally:
-            if tmp is not None:
-                tmp.cleanup()
+            if work is not None and work.is_dir():
+                shutil.rmtree(work, ignore_errors=True)
         if res.get("ok"):
             return {
                 "ok": True,
@@ -244,8 +274,15 @@ class KernelBenchAgent:
             )
             prev_metrics = prev_rd / "metrics.json"
             summary = summarize_metrics_for_prompt(prev_metrics)
+            best = self._current_best_for_prompt(c.work_dir, round_idx)
             system = system_prompt_roundk()
-            user_body = build_user_prompt_roundk(self._reference_source, prev_kernel, summary)
+            user_body = build_user_prompt_roundk(
+                self._reference_source,
+                prev_kernel,
+                summary,
+                best_previous_round=best,
+                previous_round_index=round_idx - 1,
+            )
 
         if not c.reasoning_enabled:
             _no_reasoning_banner = (
@@ -395,12 +432,17 @@ class KernelBenchAgent:
             base["status"] = "success"
 
         self.write_metrics(metrics_path, base)
+        self._update_best_from_metrics(round_idx, base)
         return base
 
     def run(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         c = self.config
         c.work_dir.mkdir(parents=True, exist_ok=True)
+        if c.start_round > 0:
+            fb = find_best_previous_round(c.work_dir, c.start_round)
+            if fb is not None:
+                self._best_by_speedup = (fb[0], fb[1])
 
         for r in range(c.start_round, c.max_rounds):
             m = self.run_round(r)
