@@ -1,5 +1,5 @@
 """
-Unit tests for KernelBenchAgent.run_round_llm_only (prompt → LLM → extract → save).
+Unit tests for KernelBenchAgent.run_generation (prompt → LLM → extract → save).
 
 Does not run run_validation.run_forward_validation, ncu, or the real query_server.
 """
@@ -59,7 +59,7 @@ class TestRunRoundLlmOnly(unittest.TestCase):
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
-            out = agent.run_round_llm_only(0)
+            out = agent.run_generation(0)
 
         self.assertNotIn("status", out)
         self.assertEqual(out["round"], 0)
@@ -89,7 +89,7 @@ class TestRunRoundLlmOnly(unittest.TestCase):
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
-            out = agent.run_round_llm_only(0)
+            out = agent.run_generation(0)
 
         self.assertEqual(out.get("status"), "parse_error")
         self.assertFalse(out.get("runnable"))
@@ -111,7 +111,7 @@ class TestRunRoundLlmOnly(unittest.TestCase):
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
-            out = agent.run_round_llm_only(0)
+            out = agent.run_generation(0)
 
         self.assertEqual(out.get("status"), "llm_subprocess_error")
         self.assertFalse(out.get("runnable"))
@@ -142,7 +142,7 @@ class TestRunRoundLlmOnly(unittest.TestCase):
 
         agent = KernelBenchAgent(self.cfg)
         with patch.object(KernelBenchAgent, "call_llm", fake_call_llm):
-            agent.run_round_llm_only(1)
+            agent.run_generation(1)
 
         self.assertIn("PREV_KERNEL_LINE", captured["user"])
         self.assertIn(REF_SNIPPET, captured["user"])

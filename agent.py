@@ -5,7 +5,7 @@ KernelBench CUDA rewrite agent: multi-round LLM (``run_llm`` subprocess) -> kern
 Per round under work_dir/round_{k:03d}/: kernel.py, prompt.txt, llm_output.txt, metrics.json.
 Default work_dir (if --work-dir omitted): ./runs/<YYYYMMDDHHMMSS>/<task_file_stem>/.
 Resume: pass the same --task-file and an existing --work-dir, then --start-round <k> (0-based);
-round_{k-1} should exist so round k can build the prior-kernel prompt (see run_round_llm_only).
+round_{k-1} should exist so round k can build the prior-kernel prompt (see run_generation).
 """
 
 from __future__ import annotations
@@ -242,7 +242,7 @@ class KernelBenchAgent:
             }
         return res
 
-    def run_round_llm_only(self, round_idx: int) -> dict[str, Any]:
+    def run_generation(self, round_idx: int) -> dict[str, Any]:
         """
         Task (from init), build prompt, call LLM, extract ```python```, write
         ``prompt.txt``, ``llm_output.txt``, and ``kernel.py`` if extraction succeeds.
@@ -359,7 +359,7 @@ class KernelBenchAgent:
         kernel_path = rd / "kernel.py"
         metrics_path = rd / "metrics.json"
 
-        base = self.run_round_llm_only(round_idx)
+        base = self.run_generation(round_idx)
         if base.get("status") in ("parse_error", "llm_subprocess_error"):
             return base
 
