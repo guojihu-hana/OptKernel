@@ -11,6 +11,7 @@ FIREWORKS_API_KEY = os.environ.get("FIREWORKS_API_KEY")
 from typing import Any, Optional
 from pathlib import Path
 import json
+import sys
 import time
 import uuid
 
@@ -226,7 +227,7 @@ def query_server(
                                 output_tokens = usage.get("output_tokens", usage.get("completion_tokens", 0)) if isinstance(usage, dict) else 0
                                 total_tokens = usage.get("total_tokens", 0) if isinstance(usage, dict) else 0
                                 usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
-                                print(usage_str)
+                                print(usage_str, file=sys.stderr, flush=True)
                                 if log_path and log_path != "":
                                     import datetime as _dt
                                     file_exists = os.path.exists(log_path)
@@ -371,7 +372,7 @@ def query_server(
             output_tokens = getattr(usage_metadata, 'candidates_token_count', 0)
             total_tokens = getattr(usage_metadata, 'total_token_count', 0)
             usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
-            print(usage_str)
+            print(usage_str, file=sys.stderr, flush=True)
             if log_path and log_path != "":
                 try:
                     import os as _os
@@ -383,7 +384,7 @@ def query_server(
                         timestamp = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
                 except Exception as e:
-                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
+                    print(f"Warning: Failed to write usage log to {log_path}: {e}", file=sys.stderr, flush=True)
 
         # Finish reason
         try:
@@ -392,9 +393,13 @@ def query_server(
                 candidate = candidates[0]
                 finish_reason_obj = getattr(candidate, 'finish_reason', None)
                 finish_reason = getattr(finish_reason_obj, 'name', str(finish_reason_obj))
-                print(colorize_finish_reason(finish_reason))
+                print(colorize_finish_reason(finish_reason), file=sys.stderr, flush=True)
                 if finish_reason in {"MAX_TOKENS", "length", "max_tokens"}:
-                    print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
+                    print(
+                        f"Warning: Output truncated due to max_tokens limit ({max_tokens})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
         except Exception:
             pass
 
@@ -431,7 +436,7 @@ def query_server(
                                    else output_tokens if input_tokens is None
                                    else None)
             usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
-            print(usage_str)
+            print(usage_str, file=sys.stderr, flush=True)
             if log_path and log_path != "":
                 try:
                     import os as _os
@@ -443,7 +448,7 @@ def query_server(
                         timestamp = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
                 except Exception as e:
-                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
+                    print(f"Warning: Failed to write usage log to {log_path}: {e}", file=sys.stderr, flush=True)
 
         outputs = []
         finish_reason: Optional[str] = None
@@ -456,12 +461,20 @@ def query_server(
             block_type = getattr(block, "type", "unknown")
             block_name = getattr(block, "name", "")
             extra = f" ({block_name})" if block_name else ""
-            print(f"Skipping non-text {server_type} content block of type '{block_type}'{extra}")
+            print(
+                f"Skipping non-text {server_type} content block of type '{block_type}'{extra}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         finish_reason = getattr(response, "stop_reason", None)
-        print(colorize_finish_reason(finish_reason))
+        print(colorize_finish_reason(finish_reason), file=sys.stderr, flush=True)
         if finish_reason in {"length", "max_tokens"}:
-            print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
+            print(
+                f"Warning: Output truncated due to max_tokens limit ({max_tokens})",
+                file=sys.stderr,
+                flush=True,
+            )
 
     else:
         if isinstance(prompt, str):
@@ -489,12 +502,20 @@ def query_server(
             )
         outputs = []
         for i, choice in enumerate(response.choices):
-            print(colorize_finish_reason(choice.finish_reason))
+            print(
+                colorize_finish_reason(choice.finish_reason),
+                file=sys.stderr,
+                flush=True,
+            )
             if i == 0:
                 finish_reason = str(choice.finish_reason) if choice.finish_reason is not None else None
 
             if choice.finish_reason == "length":
-                print(f"Warning: Output truncated due to max_tokens limit ({max_tokens})")
+                print(
+                    f"Warning: Output truncated due to max_tokens limit ({max_tokens})",
+                    file=sys.stderr,
+                    flush=True,
+                )
             outputs.append(choice.message.content)
 
         if hasattr(response, 'usage') and response.usage:
@@ -503,7 +524,7 @@ def query_server(
             total_tokens = getattr(response.usage, 'total_tokens', input_tokens + output_tokens)
 
             usage_str = f"Usage: In={input_tokens}, Out={output_tokens}, Total={total_tokens}"
-            print(usage_str)
+            print(usage_str, file=sys.stderr, flush=True)
             if log_path and log_path != "":
                 try:
                     import os as _os
@@ -515,7 +536,7 @@ def query_server(
                         timestamp = _datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         f.write(f"{timestamp},{round_idx},{call_type},{input_tokens},{output_tokens},{total_tokens}\n")
                 except Exception as e:
-                    print(f"Warning: Failed to write usage log to {log_path}: {e}")
+                    print(f"Warning: Failed to write usage log to {log_path}: {e}", file=sys.stderr, flush=True)
 
     if len(outputs) == 1:
         return _qs_ret(_pack(outputs[0], finish_reason), False)

@@ -30,6 +30,31 @@ def _subprocess_io_capture(
     }
 
 
+def _parse_llm_worker_json_stdout(raw: str) -> dict[str, Any]:
+    """
+    The llm child finally prints a single line ``json.dumps({...})`` to stdout. Legacy paths
+    may prepend colored ``Finish reason`` / ``Usage:`` lines to **stdout**; read the last
+    line that decodes as JSON, or the last ``{...}`` from ``\\{\"ok\"``.
+    """
+    s = (raw or "").strip()
+    if not s:
+        raise json.JSONDecodeError("empty stdout", "", 0)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        for line in reversed(s.splitlines()):
+            t = line.strip()
+            if t.startswith("{"):
+                try:
+                    return json.loads(t)
+                except json.JSONDecodeError:
+                    continue
+        i = s.rfind('{"ok"')
+        if i >= 0:
+            return json.loads(s[i:])
+    raise json.JSONDecodeError("no valid JSON object in child stdout", s, 0)
+
+
 def run_llm_subprocess(
     system_path: Path,
     user_path: Path,
@@ -111,7 +136,7 @@ def run_llm_subprocess(
             "subprocess": cap,
         }
     try:
-        parsed: dict[str, Any] = json.loads(out)
+        parsed: dict[str, Any] = _parse_llm_worker_json_stdout(out)
     except json.JSONDecodeError as e:
         cap = _subprocess_io_capture(proc, cmd)
         return {
