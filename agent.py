@@ -40,6 +40,11 @@ def _llm_subproc_staging_dir() -> Path:
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+def _log_phase_start(round_idx: int, phase: str, start_iso: str) -> None:
+    """``round {i} {llm|validation|ncu} {started_at}`` to stderr before each long step."""
+    print(f"Round {round_idx} {phase} {start_iso}", file=sys.stderr, flush=True)
+
 # -----------------------------------------------------------------------------
 # Prompts (text under prompts/; construction in build_prompts.py)
 # -----------------------------------------------------------------------------
@@ -136,6 +141,9 @@ class AgentConfig:
     openai_compatible_api_key: str = ""
     # vLLM extra_body.repetition_penalty; default 1.1 for MiniMax, else 1.0 (see parse_args).
     repetition_penalty: float = 1.0
+    # If set (e.g. ``http://100.101.93.16:9876``), run validation/ncu via that :mod:`worker` HTTP
+    # (paths must be visible to the worker — shared FS or same host). Env: ``OPTKERNEL_WORKER_URL``.
+    worker_url: str = ""
 
 
 class KernelBenchAgent:
@@ -303,6 +311,7 @@ class KernelBenchAgent:
 
         ll_t0 = time.perf_counter()
         ll_ts0 = _utc_iso()
+        _log_phase_start(round_idx, "llm", ll_ts0)
         llm_res = self.call_llm(system, user, round_idx, llm_out_path)
         ll_t1 = time.perf_counter()
         ll_ts1 = _utc_iso()
@@ -367,7 +376,8 @@ class KernelBenchAgent:
         eval_timing: dict[str, Any] = dict(base.get("eval_timing") or {})
         v_t0 = time.perf_counter()
         v_ts0 = _utc_iso()
-        # Fresh Python process per round: CUDA / native crashes do not take down the LLM agent.
+        _log_phase_start(round_idx, "validation", v_ts0)
+        wurl = (c.worker_url or "").strip()
         val = run_forward_validation_subprocess(
             c.task_path,
             kernel_path,
@@ -375,6 +385,7 @@ class KernelBenchAgent:
             atol=c.atol,
             rtol=c.rtol,
             gen_module_name=gen_mod_name,
+            optkernel_worker_url=wurl or None,
         )
         v_t1 = time.perf_counter()
         v_ts1 = _utc_iso()
@@ -390,13 +401,15 @@ class KernelBenchAgent:
             self.write_metrics(metrics_path, base)
             return base
 
-        # runnable: optional ncu
-        if c.run_ncu and shutil.which(nccu_bin(c.ncu_binary)):
+        # runnable: optional ncu (remote :mod:`worker` always; else local ncu on PATH)
+        if c.run_ncu and (wurl or shutil.which(nccu_bin(c.ncu_binary))):
             metric_names = effective_ncu_metrics(c.ncu_metrics)
-            metrics_args: list[str] = ["--metrics", ",".join(metric_names)]
+            metrics_comma = ",".join(metric_names)
+            metrics_args: list[str] = ["--metrics", metrics_comma]
 
             n_t0 = time.perf_counter()
             n_ts0 = _utc_iso()
+            _log_phase_start(round_idx, "ncu", n_ts0)
             ncu_info = run_ncu_profile_subprocess(
                 kernel_path,
                 rd,
@@ -405,6 +418,7 @@ class KernelBenchAgent:
                 c.ncu_extra_args,
                 launch_skip=c.ncu_launch_skip,
                 launch_count=c.ncu_launch_count,
+                optkernel_worker_url=wurl or None,
             )
             n_t1 = time.perf_counter()
             n_ts1 = _utc_iso()
@@ -550,6 +564,13 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         help=f"ncu --launch-count (default {PROFILE_K}, run_ncu.PROFILE_K)",
     )
     p.add_argument(
+        "--worker-url",
+        type=str,
+        default=os.environ.get("OPTKERNEL_WORKER_URL", "") or "",
+        help="If set, POST validation/ncu to this OptKernel HTTP worker (e.g. http://100.101.93.16:9876). "
+        "Task/work dir paths must exist on the worker (shared storage). Env: OPTKERNEL_WORKER_URL.",
+    )
+    p.add_argument(
         "--no-reasoning",
         action="store_true",
         help="Disable thinking/reasoning mode for all rounds (query_server is_reasoning_model=False).",
@@ -642,6 +663,7 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         ncu_launch_count=args.ncu_launch_count,
         openai_compatible_api_key=_api_key,
         repetition_penalty=_rep,
+        worker_url=(args.worker_url or "").strip(),
     )
 
 

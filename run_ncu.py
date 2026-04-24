@@ -416,13 +416,39 @@ def run_ncu_profile_subprocess(
     *,
     launch_skip: int = SKIP_K,
     launch_count: int = PROFILE_K,
+    cuda_visible_device: Optional[str] = None,
+    optkernel_worker_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """
-    Run :func:`run_ncu_profile` in a **fresh Python process** (isolates the parent agent from
-    the ``ncu``/import pipeline). Child prints one JSON object on stdout.
-    Metric id list is taken from ``metrics_args`` (``--metrics`` joined string), same as
-    :func:`run_ncu_profile`.
+    Run :func:`run_ncu_profile` in a **fresh Python process** *or* POST the same work to
+    a remote :mod:`worker` HTTP service.
+
+    If ``optkernel_worker_url`` is non-empty, uses :func:`worker_client.run_ncu_via_worker``
+    and ``metrics_args`` (``--metrics,comma...``) to build the request body.
+
+    :param cuda_visible_device: if set (local child only), passed as ``CUDA_VISIBLE_DEVICES`` for the child
+        (exclusive GPU in :mod:`worker` when not using HTTP).
+    :param optkernel_worker_url: e.g. ``http://host:9876``; if set, use HTTP instead of a local child.
     """
+    wu = (optkernel_worker_url or "").strip()
+    if wu:
+        from worker_client import run_ncu_via_worker
+
+        metrics_comma = ""
+        if len(metrics_args) >= 2 and str(metrics_args[0]).strip() == "--metrics":
+            metrics_comma = str(metrics_args[1])
+        if not (metrics_comma and str(metrics_comma).strip()):
+            metrics_comma = ",".join(effective_ncu_metrics([]))
+        return run_ncu_via_worker(
+            wu,
+            kernel_path,
+            work_dir,
+            ncu_binary,
+            str(metrics_comma).strip(),
+            extra_args,
+            launch_skip=launch_skip,
+            launch_count=launch_count,
+        )
     root = Path(__file__).resolve().parent
     script = root / "run_ncu.py"
     metrics_joined = ""
@@ -447,12 +473,15 @@ def run_ncu_profile_subprocess(
         "--launch-count",
         str(launch_count),
     ]
+    _env = os.environ.copy()
+    if cuda_visible_device is not None and str(cuda_visible_device).strip() != "":
+        _env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_device)
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         cwd=str(root),
-        env=os.environ.copy(),
+        env=_env,
     )
     out = (proc.stdout or "").strip()
     if not out:

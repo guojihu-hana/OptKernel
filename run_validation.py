@@ -18,7 +18,10 @@ from subprocess import CompletedProcess
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _cuda_context_error_dict(exc: BaseException) -> dict[str, Any]:
@@ -67,6 +70,67 @@ def _move_tensors_to(obj: Any, device: Any) -> Any:
     return obj
 
 
+# Max entries in numerical_error / metrics.json for per-element mismatch diagnostics.
+MISMATCH_POSITION_SAMPLE_N = 100
+
+
+def _flat_index_to_multidim(flat: int, shape: tuple[int, ...]) -> list[int]:
+    if not shape:
+        return []
+    idx = [0] * len(shape)
+    rem = flat
+    for k in range(len(shape) - 1, -1, -1):
+        s = int(shape[k])
+        idx[k] = rem % s
+        rem //= s
+    return idx
+
+
+def _tensor_mismatch_position_sample(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    atol: float,
+    rtol: float,
+    *,
+    max_n: int = MISMATCH_POSITION_SAMPLE_N,
+) -> tuple[int, list[dict[str, Any]]]:
+    """
+    List up to ``max_n`` element positions that fail :func:`torch.isclose` (same rule as
+    :func:`torch.allclose` for well-behaved float tensors), plus the total count of
+    failing elements. Flatten order matches ``reshape(-1)`` / C-order.
+    """
+    import torch
+
+    mismatch = ~torch.isclose(
+        a,
+        b,
+        atol=atol,
+        rtol=rtol,
+        equal_nan=False,
+    )
+    n_mismatch = int(mismatch.sum().item())
+    if n_mismatch == 0:
+        return 0, []
+    af, bf, mf = a.reshape(-1), b.reshape(-1), mismatch.reshape(-1)
+    flat_i = torch.nonzero(mf, as_tuple=True)[0][: int(max_n)]
+    shp = tuple(int(s) for s in a.shape)
+    sample: list[dict[str, Any]] = []
+    for t in range(flat_i.size(0)):
+        fi = int(flat_i[t].item())
+        r = float(af[fi].item())
+        g = float(bf[fi].item())
+        rec: dict[str, Any] = {
+            "flat_index": fi,
+            "ref": r,
+            "gen": g,
+            "abs_diff": abs(r - g),
+        }
+        if shp:
+            rec["index"] = _flat_index_to_multidim(fi, shp)
+        sample.append(rec)
+    return n_mismatch, sample
+
+
 def compare_outputs(
     out_ref: Any,
     out_gen: Any,
@@ -103,12 +167,20 @@ def compare_outputs(
         b = out_gen.detach().float().cpu()
         diff = (a - b).abs().max().item()
         ok = torch.allclose(a, b, atol=atol, rtol=rtol)
-        return ok, {
+        out: dict[str, Any] = {
             "max_abs_diff": float(diff),
-            "atol": atol,
-            "rtol": rtol,
-            "allclose": ok,
+            "atol": float(atol),
+            "rtol": float(rtol),
+            "allclose": bool(ok),
         }
+        if not ok:
+            n_m, sm = _tensor_mismatch_position_sample(
+                a, b, float(atol), float(rtol), max_n=MISMATCH_POSITION_SAMPLE_N
+            )
+            out["mismatching_elements_count"] = n_m
+            if sm:
+                out["mismatch_position_sample"] = sm
+        return ok, out
 
     if isinstance(out_ref, (tuple, list)):
         if len(out_ref) != len(out_gen):
@@ -247,11 +319,17 @@ def run_forward_validation(
         init_args = list(ref_mod.get_init_inputs())
         model_ref = ref_mod.Model(*init_args).to(device)
         model_gen = gen_mod.Model(*init_args).to(device)
+        # Both Model() use the *same* global RNG after get_inputs() but consume two
+        # disjoint draws—without syncing, we would compare out_ref(x; W₁) to
+        # out_gen(x; W₂) with W₁ ≠ W₂ and get meaningless numerical_error on every
+        # non-trivial run. Load reference weights into the generated module so the
+        # check is the same I/O and the same parameters.
+        model_gen.load_state_dict(model_ref.state_dict(), strict=True)
     except Exception:
         return {
             "runnable": False,
             "status": "runtime_error",
-            "runtime_error": f"Model construction failed:\n{traceback.format_exc()}",
+            "runtime_error": f"Model construction or state_dict copy failed (architecture mismatch?):\n{traceback.format_exc()}",
         }
 
     try:
@@ -355,13 +433,39 @@ def run_forward_validation_subprocess(
     atol: float,
     rtol: float,
     gen_module_name: str = "kernelbench_generated_uniq",
+    *,
+    cuda_visible_device: Optional[str] = None,
+    optkernel_worker_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """
-    Run :func:`run_forward_validation` in a **fresh Python process** (CUDA isolation from the agent).
-    One JSON object is printed to stdout by the child; this function parses and returns it.
+    Run :func:`run_forward_validation` in a **fresh Python process** (CUDA isolation from the agent)
+    *or* POST the same work to a remote :mod:`worker` HTTP service.
+
+    If ``optkernel_worker_url`` is a non-empty string, calls :func:`worker_client.run_validation_via_worker`
+    (see that module for path visibility requirements on the worker host).
+    Otherwise runs a local child process as before.
+
+    One local-child JSON object is printed to stdout by the child; this function parses and returns it.
     If the child exits before valid JSON (crash, OOM, SIGKILL), stderr/stdout are still captured in
     ``result["subprocess"]`` for :file:`metrics.json`.
+
+    :param cuda_visible_device: if set (local child only), passed as ``CUDA_VISIBLE_DEVICES`` for the child
+        (exclusive GPU in multi-tenant :mod:`worker` when not using HTTP).
+    :param optkernel_worker_url: e.g. ``http://host:9876``; if set, use HTTP instead of a local child.
     """
+    wu = (optkernel_worker_url or "").strip()
+    if wu:
+        from worker_client import run_validation_via_worker
+
+        return run_validation_via_worker(
+            wu,
+            task_path,
+            kernel_path,
+            seed,
+            atol,
+            rtol,
+            gen_module_name,
+        )
     root = Path(__file__).resolve().parent
     script = root / "run_validation.py"
     cmd: list[str] = [
@@ -381,12 +485,15 @@ def run_forward_validation_subprocess(
         "--gen-module-name",
         gen_module_name,
     ]
+    _env = os.environ.copy()
+    if cuda_visible_device is not None and str(cuda_visible_device).strip() != "":
+        _env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_device)
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
         cwd=str(root),
-        env=os.environ.copy(),
+        env=_env,
     )
     out = (proc.stdout or "").strip()
     if not out:

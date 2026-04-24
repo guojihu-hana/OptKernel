@@ -3,7 +3,7 @@ temp/
 runs/
 *.pyc
 __pycache__/
-some_bashes.sh
-launch_vllm.sh
-rlaunch_worker.sh
-rlaunch_vllm.sh
+*.sh
+get_time_analysis.py
+plot_time_analysis.py
+plot_run_llm_speedup.py
