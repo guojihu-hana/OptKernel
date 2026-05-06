@@ -15,6 +15,8 @@ import sys
 import time
 import uuid
 
+from llm_local import assistant_output_str_from_message
+
 _CONCISE_THINKING_ZH = (
     "Think concisely, avoid any repetition, and do not output the entire code during thinking."
 )
@@ -50,6 +52,14 @@ def colorize_finish_reason(reason: Optional[str]) -> str:
 def _qs_ret(result: Any, llm_output_dumped: bool = False) -> tuple[Any, bool]:
     """Pair query_server payload with whether llm_output was written via stream_dump_path (local/vllm)."""
     return (result, llm_output_dumped)
+
+
+def _assistant_message_text_with_reasoning(msg: Any) -> Any:
+    """Return assistant ``content`` unchanged if multimodal (non-str); else prepend ``<thinking>`` block."""
+    raw = getattr(msg, "content", None)
+    if not isinstance(raw, str):
+        return raw
+    return assistant_output_str_from_message(msg)
 
 
 def query_server(
@@ -516,7 +526,7 @@ def query_server(
                     file=sys.stderr,
                     flush=True,
                 )
-            outputs.append(choice.message.content)
+            outputs.append(_assistant_message_text_with_reasoning(choice.message))
 
         if hasattr(response, 'usage') and response.usage:
             input_tokens = getattr(response.usage, "prompt_tokens", getattr(response.usage, "input_tokens", 0))

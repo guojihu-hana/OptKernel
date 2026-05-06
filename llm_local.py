@@ -22,6 +22,28 @@ def llm_streaming_enabled() -> bool:
     return v not in ("0", "false", "no")
 
 
+def llm_stream_include_reasoning() -> bool:
+    """
+    Whether to merge streaming reasoning tokens into the main llm_output text stream.
+
+    Default is OFF for safety: keep ``llm_output.txt`` identical to assistant visible content.
+    Enable explicitly with ``KERNEL_LLM_STREAM_INCLUDE_REASONING=1``.
+    """
+    v = os.environ.get("KERNEL_LLM_STREAM_INCLUDE_REASONING", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def llm_safe_output_enabled() -> bool:
+    """
+    Safer llm_output mode: avoid chunk-wise assembly and write finalized text only.
+
+    Set ``KERNEL_LLM_SAFE_OUTPUT=1`` to force non-streaming persistence even when
+    streaming is enabled for normal operation.
+    """
+    v = os.environ.get("KERNEL_LLM_SAFE_OUTPUT", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def max_token_continue_enabled() -> bool:
     """Set KERNEL_LLM_MAX_TOKEN_CONTINUE=0 to disable max_tokens truncation auto-continue."""
     v = os.environ.get("KERNEL_LLM_MAX_TOKEN_CONTINUE", "1").strip().lower()
@@ -99,6 +121,142 @@ def _completion_max_tokens_capped(
     return cap
 
 
+def coerce_reasoning_to_str(val: Any) -> str:
+    """Normalize reasoning / thinking payloads from OpenAI-compatible APIs (str, dict, list)."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        for k in ("text", "reasoning", "content", "value", "thinking", "thought"):
+            t = val.get(k)
+            if isinstance(t, str) and t:
+                return t
+            nested = coerce_reasoning_to_str(t)
+            if nested:
+                return nested
+        return ""
+    if isinstance(val, list):
+        return "".join(coerce_reasoning_to_str(x) for x in val)
+    return str(val)
+
+
+def extract_reasoning_from_assistant_message(msg: Any) -> str:
+    """
+    Best-effort chain-of-thought from a chat completion *message* or streaming *delta*.
+    vLLM reasoning parsers often set ``delta.reasoning`` (see vLLM streaming example); some
+    gateways use ``reasoning_content``, nested dicts, or pydantic extras stripped from typed attrs.
+    """
+    if msg is None:
+        return ""
+    parts: list[str] = []
+
+    def add_raw(val: Any) -> None:
+        s = coerce_reasoning_to_str(val).strip()
+        if s:
+            parts.append(s)
+
+    for attr in ("reasoning_content", "reasoning", "thinking", "thought"):
+        add_raw(getattr(msg, attr, None))
+    md = getattr(msg, "model_dump", None)
+    if callable(md):
+        try:
+            d = md()
+            if isinstance(d, dict):
+                for k in (
+                    "reasoning_content",
+                    "reasoning",
+                    "thinking",
+                    "thought",
+                    "reasoning_details",
+                ):
+                    add_raw(d.get(k))
+        except Exception:
+            pass
+    extra = getattr(msg, "__pydantic_extra__", None)
+    if isinstance(extra, dict):
+        for k in ("reasoning_content", "reasoning", "thinking", "thought"):
+            add_raw(extra.get(k))
+    return "\n\n".join(parts) if parts else ""
+
+
+def iter_stream_delta_text_pieces(delta: Any) -> list[tuple[str, str]]:
+    """
+    Incremental text pieces for one SSE chunk, in server order.
+    Returns ``[(kind, text)]`` where ``kind`` is ``"reasoning"`` or ``"content"``.
+    """
+    if delta is None:
+        return []
+    content = getattr(delta, "content", None)
+    if isinstance(content, list):
+        out: list[tuple[str, str]] = []
+        for item in content:
+            if isinstance(item, dict):
+                txt = item.get("text")
+                if isinstance(txt, str) and txt:
+                    typ = str(item.get("type", "")).strip().lower()
+                    kind = "reasoning" if ("reason" in typ or "think" in typ) else "content"
+                    out.append((kind, txt))
+                    continue
+                for k in ("reasoning", "thinking", "thought", "reasoning_content"):
+                    t2 = item.get(k)
+                    if isinstance(t2, str) and t2:
+                        out.append(("reasoning", t2))
+            elif isinstance(item, str) and item:
+                out.append(("content", item))
+        if out:
+            return out
+    out2: list[tuple[str, str]] = []
+    reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+    if isinstance(reasoning, str) and reasoning:
+        out2.append(("reasoning", reasoning))
+    if isinstance(content, str) and content:
+        out2.append(("content", content))
+    return out2
+
+
+def _stream_piece_to_emit(kind: str, prev: str, piece: str) -> str:
+    """
+    Merge stream fragments without corrupting Python/code indentation.
+
+    Many gateways send **cumulative prefixes** for ``reasoning`` / ``reasoning_content`` (repeat
+    growing text). OpenAI-style ``content`` is usually **token deltas**; applying the same
+    prefix-dedup to ``content`` can falsely treat indent spaces as a shared prefix and strip
+    characters from the next line (e.g. ``def forward`` losing one leading space).
+    """
+    if not piece:
+        return ""
+    if not prev:
+        return piece
+    if piece == prev:
+        return ""
+    if kind == "reasoning":
+        if piece.startswith(prev) and len(piece) > len(prev):
+            return piece[len(prev) :]
+        return piece
+    # content: append deltas as-is (only drop exact duplicate chunks)
+    return piece
+
+
+def assistant_output_str_from_message(msg: Any) -> str:
+    """Full assistant text for logs: optional ``<thinking>`` block + string ``content``."""
+    raw = getattr(msg, "content", None)
+    if not isinstance(raw, str):
+        return str(raw or "") if raw is not None else ""
+    reasoning = extract_reasoning_from_assistant_message(msg)
+    if not reasoning.strip():
+        return raw
+    return f"<thinking>\n{reasoning.strip()}\n</thinking>\n\n{raw}"
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(p)
+
+
 def consume_chat_completion_stream(
     stream: Any,
     dump_path: Optional[str] = None,
@@ -109,6 +267,10 @@ def consume_chat_completion_stream(
 ) -> tuple[str, Optional[str], bool]:
     """Iterate OpenAI chat completion stream; print tokens to stdout; optional incremental UTF-8 file write.
 
+    Streams assistant ``content`` tokens to output file.
+    ``reasoning`` tokens are ignored by default for safety; opt-in via
+    ``KERNEL_LLM_STREAM_INCLUDE_REASONING=1``.
+
     Returns (full_text, finish_reason, file_incrementally_written).
     When dump_path is set: truncate write (``w``) unless append_dump is True, then append (``a``).
     Progress: stderr only, one line refreshed with ``\\r`` + clear-to-EOL (no stdout tokens), so the count is the only thing that moves.
@@ -118,6 +280,8 @@ def consume_chat_completion_stream(
     n_chars = 0
     f = None
     file_dumped = False
+    seen_by_kind: dict[str, str] = {"reasoning": "", "content": ""}
+    include_reasoning = llm_stream_include_reasoning()
     if dump_path:
         if append_dump and Path(dump_path).exists():
             try:
@@ -134,13 +298,23 @@ def consume_chat_completion_stream(
             ch0 = chunk.choices[0]
             delta = getattr(ch0, "delta", None)
             if delta is not None:
-                piece = getattr(delta, "content", None) or ""
-                if piece:
-                    parts.append(piece)
+                for kind, piece in iter_stream_delta_text_pieces(delta):
+                    if not piece:
+                        continue
+                    if kind == "reasoning" and not include_reasoning:
+                        # Keep main llm_output stable (content-only) unless explicitly requested.
+                        seen_by_kind[kind] = piece
+                        continue
+                    add = _stream_piece_to_emit(kind, seen_by_kind.get(kind, ""), piece)
+                    if not add:
+                        seen_by_kind[kind] = piece
+                        continue
+                    seen_by_kind[kind] = piece
+                    parts.append(add)
                     if f is not None:
-                        f.write(piece)
+                        f.write(add)
                         f.flush()
-                        n_chars += len(piece)
+                        n_chars += len(add)
                         # stderr only: stdout token stream interleaves with \\r and breaks single-line progress
                         tag = _dump_progress_tag(round_idx, continuation_k)
                         print(
@@ -150,7 +324,7 @@ def consume_chat_completion_stream(
                             flush=True,
                         )
                     else:
-                        print(piece, end="", flush=True)
+                        print(add, end="", flush=True)
             fr = getattr(ch0, "finish_reason", None)
             if fr:
                 finish_reason = str(fr)
@@ -200,6 +374,16 @@ def openai_chat_completion_with_truncation_retry(
     last_fr: Optional[str] = None
     file_dumped = False
 
+    safe_output = bool(dump_path) and llm_safe_output_enabled()
+    effective_stream = bool(use_stream) and (not safe_output)
+    if safe_output:
+        print(
+            "[llm_local] KERNEL_LLM_SAFE_OUTPUT=1: disable chunk-wise streaming assembly "
+            "for llm_output; writing finalized text per request.",
+            file=sys.stderr,
+            flush=True,
+        )
+
     for k in range(eff_max_cont + 1):
         user_content = original_user + accumulated
         if k > 0:
@@ -229,7 +413,7 @@ def openai_chat_completion_with_truncation_retry(
         if eb is not None:
             kwargs["extra_body"] = eb
 
-        if use_stream:
+        if effective_stream:
             kwargs["stream"] = True
             stream = client.chat.completions.create(**kwargs)
             segment, fr, dumped = consume_chat_completion_stream(
@@ -246,11 +430,11 @@ def openai_chat_completion_with_truncation_retry(
             fr = None
             if response.choices:
                 c0 = response.choices[0]
-                segment = str(getattr(c0.message, "content", "") or "")
+                segment = assistant_output_str_from_message(c0.message)
                 fr_raw = getattr(c0, "finish_reason", None)
                 fr = str(fr_raw) if fr_raw is not None else None
             if dump_path:
-                Path(dump_path).write_text(accumulated + segment, encoding="utf-8")
+                _atomic_write_text(dump_path, accumulated + segment)
                 tag = _dump_progress_tag(round_idx, k)
                 print(
                     f"\r[llm_output.txt] {tag} written: {len(accumulated) + len(segment)} chars",
