@@ -1,5 +1,9 @@
 temp/
-
+figs/
+figs/*
+*.csv
+gemm_temp_monitor.py
+plot_metrics_time_ratio.py
 runs/
 *.pyc
 __pycache__/

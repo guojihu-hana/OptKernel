@@ -41,7 +41,7 @@ GPU_SPEC_INFO = {
         "Shared memory capacity per SM": "228 KB",
         "Maximum shared memory per thread block": "227 KB",
     },
-    "NVIDIA H200": {
+    "H200": {
         "GPU Architecture": "Hopper",
         "GPU Memory": "141 GB HBM3e",
         "Memory Bandwidth": "4.8 TB/s",
@@ -154,6 +154,21 @@ GPU_SPEC_INFO = {
         "Maximum shared memory per thread block": "163 KB",
     }
 }
+
+def format_gpu_specs_for_prompt(gpu_type: str) -> str:
+    """
+    Human-readable block for LLM prompts: target GPU name plus bullet list from :data:`GPU_SPEC_INFO`.
+    Raises ``KeyError`` if ``gpu_type`` is unknown.
+    """
+    if gpu_type not in GPU_SPEC_INFO:
+        known = ", ".join(sorted(GPU_SPEC_INFO))
+        raise KeyError(f"Unknown gpu_type={gpu_type!r}. Known types: {known}")
+    spec = GPU_SPEC_INFO[gpu_type]
+    lines = [f"Target GPU: {gpu_type}", "", "Hardware parameters:"]
+    for k, v in spec.items():
+        lines.append(f"- {k}: {v}")
+    return "\n".join(lines)
+
 
 GPU_BEST_PRACTICES = [
     # From https://docs.nvidia.com/cuda/ada-tuning-guide/index.html

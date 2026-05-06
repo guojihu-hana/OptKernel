@@ -68,6 +68,8 @@ from run_ncu import (
 )
 from run_validation import run_forward_validation_subprocess
 
+from hardware.gpu_specs import GPU_SPEC_INFO
+
 # -----------------------------------------------------------------------------
 # Extract ```python``` from LLM output
 # -----------------------------------------------------------------------------
@@ -144,6 +146,8 @@ class AgentConfig:
     # If set (e.g. ``http://100.101.93.16:9876``), run validation/ncu via that :mod:`worker` HTTP
     # (paths must be visible to the worker — shared FS or same host). Env: ``OPTKERNEL_WORKER_URL``.
     worker_url: str = ""
+    # Key in ``hardware/gpu_specs.GPU_SPEC_INFO``; injected into every round's user prompt.
+    gpu_type: str = "H200"
 
 
 class KernelBenchAgent:
@@ -271,7 +275,7 @@ class KernelBenchAgent:
 
         if round_idx == 0:
             system = system_prompt_round0()
-            user_body = build_user_prompt_round0(self._reference_source)
+            user_body = build_user_prompt_round0(self._reference_source, gpu_type=c.gpu_type)
         else:
             prev_rd = self.round_dir(round_idx - 1)
             pk = prev_rd / "kernel.py"
@@ -288,6 +292,7 @@ class KernelBenchAgent:
                 self._reference_source,
                 prev_kernel,
                 summary,
+                gpu_type=c.gpu_type,
                 best_previous_round=best,
                 previous_round_index=round_idx - 1,
             )
@@ -500,6 +505,15 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--atol", type=float, default=1e-4)
     p.add_argument("--rtol", type=float, default=1e-4)
+    _gpu_default = (os.environ.get("KERNEL_AGENT_GPU_TYPE") or "H200").strip()
+    p.add_argument(
+        "--gpu-type",
+        type=str,
+        default=_gpu_default,
+        choices=sorted(GPU_SPEC_INFO.keys()),
+        help="GPU model; injects entries from hardware/gpu_specs.py into each round's user prompt. "
+        "Env: KERNEL_AGENT_GPU_TYPE (default when unset: H200).",
+    )
     p.add_argument("--server-type", type=str, default=os.environ.get("KERNEL_AGENT_SERVER", "local"))
     p.add_argument("--server-address", type=str, default="localhost")
     p.add_argument("--server-port", type=int, default=30000)
@@ -664,6 +678,7 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         openai_compatible_api_key=_api_key,
         repetition_penalty=_rep,
         worker_url=(args.worker_url or "").strip(),
+        gpu_type=args.gpu_type,
     )
 
 

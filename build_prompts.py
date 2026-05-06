@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+from hardware.gpu_specs import format_gpu_specs_for_prompt
+
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 
@@ -95,9 +97,11 @@ def system_prompt_roundk() -> str:
     return _load("roundk_system.txt").strip()
 
 
-def build_user_prompt_round0(reference_source: str) -> str:
+def build_user_prompt_round0(reference_source: str, *, gpu_type: str) -> str:
     intro = _load("round0_user_intro.txt").rstrip()
+    gpu_block = format_gpu_specs_for_prompt(gpu_type)
     return (
+        f"{gpu_block}\n\n"
         f"{intro}\n\n"
         "Reference KernelBench file:\n\n"
         f"```python\n{reference_source.rstrip()}\n```\n"
@@ -109,11 +113,14 @@ def build_user_prompt_roundk(
     previous_kernel: str,
     previous_metrics_summary: str,
     *,
+    gpu_type: str,
     best_previous_round: Optional[Tuple[int, float, str, str]] = None,
     previous_round_index: int = 0,
 ) -> str:
     intro = _load("roundk_user_intro.txt").rstrip()
+    gpu_block = format_gpu_specs_for_prompt(gpu_type)
     s = (
+        f"{gpu_block}\n\n"
         f"{intro}\n\n"
         "Original reference:\n\n"
         f"```python\n{reference_source.rstrip()}\n```\n\n"
