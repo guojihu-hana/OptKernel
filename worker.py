@@ -32,6 +32,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional, cast
@@ -58,6 +59,9 @@ class _Job:
         "err",
         "wait_s",
         "exec_s",
+        "queued_at_ts",
+        "started_at_ts",
+        "finished_at_ts",
         "event",
     )
 
@@ -71,7 +75,16 @@ class _Job:
         self.err: Optional[BaseException] = None
         self.wait_s = 0.0
         self.exec_s = 0.0
+        self.queued_at_ts = time.time()
+        self.started_at_ts = 0.0
+        self.finished_at_ts = 0.0
         self.event = threading.Event()
+
+
+def _iso(ts: float) -> str:
+    if ts <= 0:
+        return ""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
 def _pre_import() -> None:
@@ -166,6 +179,7 @@ class _ServiceContext:
             t_slot = time.perf_counter()
             j.wait_s = t_slot - j.t_enqueued
             j.device = d
+            j.started_at_ts = time.time()
             with self._occ_lock:
                 self.occupation[d] = (j.task_id, j.kind)
             t0 = time.perf_counter()
@@ -177,6 +191,7 @@ class _ServiceContext:
             t1 = time.perf_counter()
             if t0 > 0.0:
                 j.exec_s = t1 - t0
+            j.finished_at_ts = time.time()
             with self._occ_lock:
                 self.occupation[d] = None
             self._free.put(d)
@@ -283,6 +298,9 @@ def make_request_handler(
                 "wait_s": round(job.wait_s, 6),
                 "execute_s": round(job.exec_s, 6),
                 "gpu": job.device,
+                "queued_at": _iso(job.queued_at_ts),
+                "started_at": _iso(job.started_at_ts),
+                "finished_at": _iso(job.finished_at_ts),
             }
             if job.err is not None:
                 b = {

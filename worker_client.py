@@ -73,7 +73,13 @@ def _parse_worker_response(raw: str, is_validation: bool) -> dict[str, Any]:
         )
     if d.get("ok") is True and "result" in d:
         res = d["result"]
-        return res if isinstance(res, dict) else _err_payload(is_validation, "result is not a dict")
+        if not isinstance(res, dict):
+            return _err_payload(is_validation, "result is not a dict")
+        qt = d.get("queue_timing")
+        if qt is not None and "queue_timing" not in res:
+            res = dict(res)
+            res["queue_timing"] = qt
+        return res
     err = str(d.get("error", "unknown error"))
     tb = str(d.get("traceback", ""))[:8_000]
     if is_validation:
