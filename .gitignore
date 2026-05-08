@@ -5,6 +5,7 @@ figs/*
 gemm_temp_monitor.py
 plot_metrics_time_ratio.py
 runs/
+spec_act_runs/
 *.pyc
 __pycache__/
 *.sh

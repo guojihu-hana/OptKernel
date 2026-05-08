@@ -1,6 +1,9 @@
 #!/bin/bash
 GPU_NUM=${1:-2}
 CPU_NUM=${2:-$((GPU_NUM * 8))}
+if [ "${CPU_NUM}" -lt 32 ]; then
+    CPU_NUM=32
+fi
 MEMORY=${3:-$((GPU_NUM * 64000))}
 echo "GPU_NUM: ${GPU_NUM}, CPU_NUM: ${CPU_NUM}, MEMORY: ${MEMORY}"
 
