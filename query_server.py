@@ -288,6 +288,10 @@ def query_server(
                 if int(budget_tokens or 0) > 0:
                     think_obj["budget_tokens"] = int(budget_tokens)
                 extra_body = {"thinking": think_obj}
+            else:
+                # For GLM-5/5.1 on vLLM, thinking is ON by default unless explicitly disabled.
+                # https://docs.vllm.ai/projects/recipes/en/latest/GLM/GLM5.html#openai-client-example
+                extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
 
             _dp = (stream_dump_path or "").strip() or None
             max_cont = 0 if not max_token_continue_enabled() else max_continuation_rounds()

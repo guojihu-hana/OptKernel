@@ -38,12 +38,13 @@ def _llm_subproc_staging_dir() -> Path:
 
 
 def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _log_phase_start(round_idx: int, phase: str, start_iso: str) -> None:
-    """``round {i} {llm|validation|ncu} {started_at}`` to stderr before each long step."""
-    print(f"Round {round_idx} {phase} {start_iso}", file=sys.stderr, flush=True)
+def _log_phase_start(round_idx: int, phase: str, start_iso: str, task_name: str = "") -> None:
+    """``round {i} {llm|validation|ncu} {started_at} [task]`` to stderr before each long step."""
+    suffix = f" task={task_name}" if task_name else ""
+    print(f"Round {round_idx} {phase} {start_iso}{suffix}", file=sys.stderr, flush=True)
 
 # -----------------------------------------------------------------------------
 # Prompts (text under prompts/; construction in build_prompts.py)
@@ -129,6 +130,10 @@ class AgentConfig:
     max_context_length: int = 0
     # Thinking / reasoning API (see query_server is_reasoning_model). Default: on.
     reasoning_enabled: bool = True
+    # Optional thinking token budget forwarded to query_server (0 = server default / unlimited).
+    thinking_budget_tokens: int = 0
+    # For OpenAI reasoning models; ignored by vLLM/local paths.
+    reasoning_effort: str = "medium"
     """If set, only these round indices use reasoning; all others do not."""
     reasoning_only_rounds: Optional[Set[int]] = None
     """Rounds where reasoning is forced off (when reasoning_only_rounds is unset)."""
@@ -239,6 +244,8 @@ class KernelBenchAgent:
                 server_port=c.server_port,
                 model_name=c.model_name,
                 is_reasoning_model=self.reasoning_for_round(round_idx),
+                budget_tokens=int(c.thinking_budget_tokens or 0),
+                reasoning_effort=str(c.reasoning_effort or "medium"),
                 openai_compatible_api_key=c.openai_compatible_api_key,
                 repetition_penalty=c.repetition_penalty,
                 max_context_length=c.max_context_length,
@@ -265,6 +272,7 @@ class KernelBenchAgent:
         Otherwise returns a partial dict without validation/ncu; :meth:`run_round` continues from there.
         """
         c = self.config
+        task_name = c.task_path.stem
         rd = self.round_dir(round_idx)
         rd.mkdir(parents=True, exist_ok=True)
 
@@ -316,7 +324,7 @@ class KernelBenchAgent:
 
         ll_t0 = time.perf_counter()
         ll_ts0 = _utc_iso()
-        _log_phase_start(round_idx, "llm", ll_ts0)
+        _log_phase_start(round_idx, "llm", ll_ts0, task_name)
         llm_res = self.call_llm(system, user, round_idx, llm_out_path)
         ll_t1 = time.perf_counter()
         ll_ts1 = _utc_iso()
@@ -369,6 +377,7 @@ class KernelBenchAgent:
 
     def run_round(self, round_idx: int) -> dict[str, Any]:
         c = self.config
+        task_name = c.task_path.stem
         rd = self.round_dir(round_idx)
         kernel_path = rd / "kernel.py"
         metrics_path = rd / "metrics.json"
@@ -381,7 +390,7 @@ class KernelBenchAgent:
         eval_timing: dict[str, Any] = dict(base.get("eval_timing") or {})
         v_t0 = time.perf_counter()
         v_ts0 = _utc_iso()
-        _log_phase_start(round_idx, "validation", v_ts0)
+        _log_phase_start(round_idx, "validation", v_ts0, task_name)
         wurl = (c.worker_url or "").strip()
         val = run_forward_validation_subprocess(
             c.task_path,
@@ -399,6 +408,10 @@ class KernelBenchAgent:
             "finished_at": v_ts1,
             "seconds": round(v_t1 - v_t0, 6),
         }
+        # Worker queue timing belongs to timing section (not top-level validation payload).
+        v_qt = val.pop("queue_timing", None) if isinstance(val, dict) else None
+        if v_qt is not None:
+            eval_timing["validation"]["queue_timing"] = v_qt
         base.update(val)
         base["eval_timing"] = eval_timing
 
@@ -414,7 +427,7 @@ class KernelBenchAgent:
 
             n_t0 = time.perf_counter()
             n_ts0 = _utc_iso()
-            _log_phase_start(round_idx, "ncu", n_ts0)
+            _log_phase_start(round_idx, "ncu", n_ts0, task_name)
             ncu_info = run_ncu_profile_subprocess(
                 kernel_path,
                 rd,
@@ -432,6 +445,9 @@ class KernelBenchAgent:
                 "finished_at": n_ts1,
                 "seconds": round(n_t1 - n_t0, 6),
             }
+            n_qt = ncu_info.pop("queue_timing", None) if isinstance(ncu_info, dict) else None
+            if n_qt is not None:
+                eval_timing["ncu"]["queue_timing"] = n_qt
             base["ncu"] = ncu_info
             if ncu_info.get("returncode") != 0:
                 base["status"] = "ncu_error"
@@ -590,6 +606,21 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         help="Disable thinking/reasoning mode for all rounds (query_server is_reasoning_model=False).",
     )
     p.add_argument(
+        "--thinking-budget-tokens",
+        type=int,
+        default=int(os.environ.get("KERNEL_THINKING_BUDGET_TOKENS", "0") or 0),
+        help="Thinking budget tokens sent to query_server (0 = provider default/unlimited). "
+        "Env: KERNEL_THINKING_BUDGET_TOKENS.",
+    )
+    p.add_argument(
+        "--reasoning-effort",
+        type=str,
+        default=(os.environ.get("KERNEL_REASONING_EFFORT", "medium") or "medium"),
+        choices=["low", "medium", "high"],
+        help="Reasoning effort for OpenAI reasoning APIs (ignored by local/vllm). "
+        "Env: KERNEL_REASONING_EFFORT.",
+    )
+    p.add_argument(
         "--reasoning-only-rounds",
         type=str,
         default="",
@@ -649,6 +680,8 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         p.error("--start-round must be < --max-rounds (run range is [start-round, max-rounds))")
     if int(args.max_context_length or 0) < 0:
         p.error("--max-context-length must be >= 0 (0 = disabled)")
+    if int(args.thinking_budget_tokens or 0) < 0:
+        p.error("--thinking-budget-tokens must be >= 0")
 
     return AgentConfig(
         task_path=task_path,
@@ -667,6 +700,8 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         max_context_length=int(args.max_context_length or 0),
         temperature=args.temperature,
         reasoning_enabled=not args.no_reasoning,
+        thinking_budget_tokens=int(args.thinking_budget_tokens or 0),
+        reasoning_effort=str(args.reasoning_effort or "medium"),
         reasoning_only_rounds=only,
         reasoning_except_rounds=exc,
         run_ncu=not args.no_ncu,

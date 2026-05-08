@@ -68,6 +68,8 @@ def run_llm_subprocess(
     server_port: int,
     model_name: str,
     is_reasoning_model: bool,
+    budget_tokens: int,
+    reasoning_effort: str,
     openai_compatible_api_key: str,
     repetition_penalty: float,
     max_context_length: int,
@@ -105,6 +107,10 @@ def run_llm_subprocess(
         str(model_name),
         "--is-reasoning",
         "1" if is_reasoning_model else "0",
+        "--budget-tokens",
+        str(int(budget_tokens or 0)),
+        "--reasoning-effort",
+        str(reasoning_effort or "medium"),
         "--api-key",
         str(openai_compatible_api_key or ""),
         "--repetition-penalty",
@@ -177,6 +183,8 @@ def _main_llm_call_worker() -> int:
     p.add_argument("--server-port", type=int, default=30000)
     p.add_argument("--model", type=str, default="")
     p.add_argument("--is-reasoning", type=str, default="1", help="0 or 1")
+    p.add_argument("--budget-tokens", type=int, default=0)
+    p.add_argument("--reasoning-effort", type=str, default="medium")
     p.add_argument("--api-key", type=str, default="")
     p.add_argument("--repetition-penalty", type=float, default=1.0)
     p.add_argument("--max-context-length", type=int, default=0)
@@ -200,6 +208,8 @@ def _main_llm_call_worker() -> int:
             server_port=int(args.server_port),
             model_name=args.model,
             is_reasoning_model=bool(is_reasoning),
+            budget_tokens=int(args.budget_tokens or 0),
+            reasoning_effort=str(args.reasoning_effort or "medium"),
             call_type="kernel_bench_agent",
             round_idx=int(args.round_idx),
             stream_dump_path=sdp,
