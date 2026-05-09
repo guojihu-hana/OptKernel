@@ -102,7 +102,7 @@ def main() -> int:
     p.add_argument("--server-address", type=str, default="localhost")
     p.add_argument("--server-port", type=int, default=8000)
     p.add_argument("--model", type=str, default=os.environ.get("KERNEL_AGENT_MODEL", "glm-5.1"))
-    p.add_argument("--api-key", type=str, default=os.environ.get("VLLM_API_KEY", ""))
+    p.add_argument("--api-key", type=str, default=os.environ.get("OPENAI_API_KEY", ""))
     p.add_argument("--gpu-type", type=str, default=os.environ.get("KERNEL_AGENT_GPU_TYPE", "H200"))
     p.add_argument("--max-tokens", type=int, default=65536)
     p.add_argument("--max-context-length", type=int, default=0)

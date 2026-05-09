@@ -9,6 +9,7 @@ spec_act_runs/
 *.pyc
 __pycache__/
 *.sh
+*.txt
 get_time_analysis.py
-plot_time_analysis.py
-plot_run_llm_speedup.py
+plot_*.py
+pyrightconfig.json
