@@ -135,6 +135,34 @@ def _split_system_user(prompt_text: str) -> tuple[str, str]:
     return ("", prompt_text.strip())
 
 
+def _round_head_suffix(target_dir: Path, output_subdir: str | None) -> str:
+    r = _round_index_from_dirname(target_dir.name)
+    round_part = f"r{r:03d}" if r is not None else "r000"
+    head_part = "h0"
+    if output_subdir:
+        m = re.fullmatch(r"head(\d+)", output_subdir.strip())
+        if m:
+            head_part = f"h{m.group(1)}"
+    return f"{round_part}_{head_part}"
+
+
+def _uniquify_load_inline_name(py_src: str, suffix: str) -> str:
+    """Append unique suffix to first ``load_inline(name=...)`` occurrence."""
+    if not py_src or not suffix:
+        return py_src
+    pat = re.compile(r"(load_inline\s*\(\s*.*?\bname\s*=\s*)([\"'])([^\"']+)\2", re.DOTALL)
+
+    def _repl(m: re.Match[str]) -> str:
+        old = m.group(3)
+        if old.endswith(f"_{suffix}"):
+            new = old
+        else:
+            new = f"{old}_{suffix}"
+        return f"{m.group(1)}{m.group(2)}{new}{m.group(2)}"
+
+    return pat.sub(_repl, py_src, count=1)
+
+
 def _to_float(v: object) -> float | None:
     try:
         if v is None:
@@ -367,6 +395,12 @@ def run_speculative_pipeline(
     system, user = _split_system_user(_read_text(spec_prompt_path))
     addr, port = _host_to_addr_port(args.host)
     model_name = (args.model or "").strip() or _discover_model(args.host, args.api_key or "")
+    round_idx = _round_index_from_dirname(td.name)
+    common_meta: dict[str, object] = {
+        "model_name": model_name,
+        "round_idx": (round_idx if round_idx is not None else int(args.round_idx)),
+        "head": int(hn),
+    }
     cfg = AgentConfig(
         task_path=Path(args.task_file).resolve(),
         work_dir=out_dir,
@@ -409,6 +443,7 @@ def run_speculative_pipeline(
     }
     if not llm.get("ok"):
         payload: dict[str, object] = {
+            **common_meta,
             "status": "llm_subprocess_error",
             "runnable": False,
             "llm": llm,
@@ -426,6 +461,7 @@ def run_speculative_pipeline(
     py_src = extract_python_module(raw)
     if py_src is None:
         payload = {
+            **common_meta,
             "status": "parse_error",
             "runnable": False,
             "parse_error": "No ```python ... ``` block found in LLM output.",
@@ -436,6 +472,8 @@ def run_speculative_pipeline(
         agent.write_metrics(metrics_path, payload)
         return payload
 
+    suffix = _round_head_suffix(td, subdir)
+    py_src = _uniquify_load_inline_name(py_src, suffix)
     kernel_path.write_text(py_src, encoding="utf-8")
 
     val = run_forward_validation_subprocess(
@@ -448,6 +486,7 @@ def run_speculative_pipeline(
         optkernel_worker_url=(args.worker_url or "").strip() or None,
     )
     base: dict[str, object] = {
+        **common_meta,
         "status": val.get("status"),
         "runnable": bool(val.get("runnable")),
         "spec_prompt": str(spec_prompt_path),
@@ -518,6 +557,12 @@ def _run_speculative_llm_stage(
     system, user = _split_system_user(_read_text(spec_prompt_path))
     addr, port = _host_to_addr_port(args.host)
     model_name = (args.model or "").strip() or _discover_model(args.host, args.api_key or "")
+    round_idx = _round_index_from_dirname(td.name)
+    common_meta: dict[str, object] = {
+        "model_name": model_name,
+        "round_idx": (round_idx if round_idx is not None else int(args.round_idx)),
+        "head": int(head_n),
+    }
     cfg = AgentConfig(
         task_path=Path(args.task_file).resolve(),
         work_dir=out_dir,
@@ -560,6 +605,7 @@ def _run_speculative_llm_stage(
     }
     if not llm.get("ok"):
         payload: dict[str, object] = {
+            **common_meta,
             "status": "llm_subprocess_error",
             "runnable": False,
             "llm": llm,
@@ -577,6 +623,7 @@ def _run_speculative_llm_stage(
     py_src = extract_python_module(raw)
     if py_src is None:
         payload = {
+            **common_meta,
             "status": "parse_error",
             "runnable": False,
             "parse_error": "No ```python ... ``` block found in LLM output.",
@@ -587,10 +634,13 @@ def _run_speculative_llm_stage(
         agent.write_metrics(metrics_path, payload)
         return {"ready_for_eval": False, "result": payload}
 
+    suffix = _round_head_suffix(td, output_subdir)
+    py_src = _uniquify_load_inline_name(py_src, suffix)
     kernel_path.write_text(py_src, encoding="utf-8")
     return {
         "ready_for_eval": True,
         "cfg": cfg,
+        "common_meta": common_meta,
         "spec_prompt_path": str(spec_prompt_path),
         "kernel_path": str(kernel_path),
         "llm_output_path": str(llm_out_path),
@@ -612,6 +662,16 @@ def _run_speculative_eval_stage(
     metrics_path = Path(str(llm_stage_payload["metrics_path"]))
     out_dir = kernel_path.parent
     agent = KernelBenchAgent(cfg)
+    cm = llm_stage_payload.get("common_meta")
+    common_meta: dict[str, object] = dict(cm) if isinstance(cm, dict) else {}
+    if not common_meta:
+        common_meta = {
+            "model_name": getattr(cfg, "model_name", ""),
+            "round_idx": int(args.round_idx),
+            "head": None,
+        }
+    et = llm_stage_payload.get("eval_timing")
+    eval_timing = dict(et) if isinstance(et, dict) else {}
 
     val = run_forward_validation_subprocess(
         Path(args.task_file).resolve(),
@@ -623,13 +683,14 @@ def _run_speculative_eval_stage(
         optkernel_worker_url=(args.worker_url or "").strip() or None,
     )
     base: dict[str, object] = {
+        **common_meta,
         "status": val.get("status"),
         "runnable": bool(val.get("runnable")),
         "spec_prompt": str(spec_prompt_path),
         "kernel_path": str(kernel_path),
         "llm_output_path": str(llm_out_path),
         "validation": val,
-        "eval_timing": dict(llm_stage_payload.get("eval_timing") or {}),
+        "eval_timing": eval_timing,
     }
     if not bool(val.get("runnable")):
         agent.write_metrics(metrics_path, base)
