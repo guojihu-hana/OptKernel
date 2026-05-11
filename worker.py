@@ -18,6 +18,9 @@ Validation + ncu profile microservice (FCFS job queue, **idle-GPU** assignment).
   and :func:`run_ncu.run_ncu_profile_subprocess` (or ``"metrics"`` as comma list).
 
 Env: ``WORKER_HOST`` (``0.0.0.0``), ``WORKER_PORT`` (``9876``), ``WORKER_GPUS`` (e.g. ``0,1``).
+``OPTKERNEL_WORKER_JOB_TIMEOUT_S`` (default ``600``): per-job wall time for each local
+``validation`` / ``ncu`` subprocess; on expiry the child is killed and the response
+carries timeout diagnostics (``<=0`` disables).
 """
 
 from __future__ import annotations
@@ -39,6 +42,17 @@ from typing import Any, Optional, cast
 
 _lock = threading.Lock()
 _next_id = 0
+
+
+def _job_subprocess_timeout_s() -> Optional[float]:
+    raw = (os.environ.get("OPTKERNEL_WORKER_JOB_TIMEOUT_S") or "600").strip()
+    try:
+        v = float(raw)
+    except ValueError:
+        return 600.0
+    if v <= 0:
+        return None
+    return v
 
 
 def _new_task_id() -> int:
@@ -96,6 +110,7 @@ def _run_job_body(j: _Job, device: str) -> None:
     from run_validation import run_forward_validation_subprocess
     from run_ncu import run_ncu_profile_subprocess, PROFILE_K, SKIP_K, effective_ncu_metrics
 
+    job_to = _job_subprocess_timeout_s()
     if j.kind == "validation":
         p = j.payload
         j.out = run_forward_validation_subprocess(
@@ -106,6 +121,7 @@ def _run_job_body(j: _Job, device: str) -> None:
             float(p.get("rtol", 1e-4)),
             str(p.get("gen_module_name", "kernelbench_generated_uniq")),
             cuda_visible_device=device,
+            subprocess_timeout_s=job_to,
         )
     else:
         p = j.payload
@@ -133,6 +149,7 @@ def _run_job_body(j: _Job, device: str) -> None:
             launch_skip=int(p.get("launch_skip", SKIP_K)),
             launch_count=int(p.get("launch_count", PROFILE_K)),
             cuda_visible_device=device,
+            subprocess_timeout_s=job_to,
         )
 
 

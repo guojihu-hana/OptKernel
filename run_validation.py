@@ -436,6 +436,7 @@ def run_forward_validation_subprocess(
     *,
     cuda_visible_device: Optional[str] = None,
     optkernel_worker_url: Optional[str] = None,
+    subprocess_timeout_s: Optional[float] = None,
 ) -> dict[str, Any]:
     """
     Run :func:`run_forward_validation` in a **fresh Python process** (CUDA isolation from the agent)
@@ -452,6 +453,8 @@ def run_forward_validation_subprocess(
     :param cuda_visible_device: if set (local child only), passed as ``CUDA_VISIBLE_DEVICES`` for the child
         (exclusive GPU in multi-tenant :mod:`worker` when not using HTTP).
     :param optkernel_worker_url: e.g. ``http://host:9876``; if set, use HTTP instead of a local child.
+    :param subprocess_timeout_s: if set and > 0 (local child only), ``subprocess.run(..., timeout=...)``;
+        on expiry the child is killed and a ``runtime_error`` payload is returned.
     """
     wu = (optkernel_worker_url or "").strip()
     if wu:
@@ -488,13 +491,34 @@ def run_forward_validation_subprocess(
     _env = os.environ.copy()
     if cuda_visible_device is not None and str(cuda_visible_device).strip() != "":
         _env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_device)
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        cwd=str(root),
-        env=_env,
-    )
+    to: Optional[float] = None
+    if subprocess_timeout_s is not None and float(subprocess_timeout_s) > 0:
+        to = float(subprocess_timeout_s)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=str(root),
+            env=_env,
+            timeout=to,
+        )
+    except subprocess.TimeoutExpired as e:
+        return {
+            "runnable": False,
+            "status": "runtime_error",
+            "runtime_error": (
+                f"validation subprocess exceeded {to}s (killed). "
+                "Fix hung kernel or raise subprocess_timeout_s / OPTKERNEL_WORKER_JOB_TIMEOUT_S."
+            ),
+            "subprocess": {
+                "returncode": None,
+                "command": cmd,
+                "stderr": ((getattr(e, "stderr", None) or "") or "")[:16_000],
+                "stdout": ((getattr(e, "stdout", None) or "") or "")[:16_000],
+                "timeout_s": to,
+            },
+        }
     out = (proc.stdout or "").strip()
     if not out:
         cap = _subprocess_io_capture(proc, cmd)
