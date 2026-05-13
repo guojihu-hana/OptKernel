@@ -128,6 +128,7 @@ def run_ncu_via_worker(
     *,
     launch_skip: int,
     launch_count: int,
+    ref_task_path: Path | None = None,
 ) -> dict[str, Any]:
     b = _base(base_url)
     p: dict[str, Any] = {
@@ -139,4 +140,6 @@ def run_ncu_via_worker(
         "launch_skip": launch_skip,
         "launch_count": launch_count,
     }
+    if ref_task_path is not None:
+        p["ref_task_file"] = str(Path(ref_task_path).resolve())
     return _post_json(f"{b}/ncu", p, is_validation=False)

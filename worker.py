@@ -150,6 +150,7 @@ def _run_job_body(j: _Job, device: str) -> None:
             launch_count=int(p.get("launch_count", PROFILE_K)),
             cuda_visible_device=device,
             subprocess_timeout_s=job_to,
+            ref_task_path=Path(p["ref_task_file"]).resolve() if p.get("ref_task_file") else None,
         )
 
 

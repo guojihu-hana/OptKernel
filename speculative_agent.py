@@ -81,6 +81,39 @@ def _discover_round_dirs(parent: Path) -> list[Path]:
     return sorted(rounds, key=lambda p: p.name)
 
 
+def _resolve_sweep_start_round(
+    start_round: object,
+    rounds: list[Path],
+    output_rounds: list[Path] | None = None,
+) -> int:
+    value = str(start_round or "0").strip().lower()
+    if value == "auto":
+        if output_rounds is not None:
+            output_round_indices = [
+                idx
+                for idx in (_round_index_from_dirname(rd.name) for rd in output_rounds)
+                if idx is not None
+            ]
+            if output_round_indices:
+                return max(output_round_indices) + 1
+            return 0
+        round_indices = [
+            idx
+            for idx in (_round_index_from_dirname(rd.name) for rd in rounds)
+            if idx is not None
+        ]
+        if not round_indices:
+            raise ValueError("--start-round auto requires at least one round_* directory")
+        return max(round_indices)
+    try:
+        out = int(value)
+    except ValueError as e:
+        raise ValueError("--start-round must be a non-negative integer or 'auto'") from e
+    if out < 0:
+        raise ValueError("--start-round must be >= 0")
+    return out
+
+
 def _head_sizes_through_full(total_tokens: int, step_n: int) -> list[int]:
     """Return ``[step_n, 2*step_n, ..., total_tokens]`` (multiples of ``step_n``, then full if needed)."""
     if total_tokens <= 0 or step_n <= 0:
@@ -167,9 +200,22 @@ def _to_float(v: object) -> float | None:
     try:
         if v is None:
             return None
+        if not isinstance(v, (int, float, str)):
+            return None
         return float(v)
     except Exception:
         return None
+
+
+def _validation_benchmark_ok(val: object) -> tuple[bool, str | None]:
+    bt = val.get("benchmark_timing") if isinstance(val, dict) else None
+    if not isinstance(bt, dict):
+        return False, "validation benchmark_timing missing"
+    if bool(bt.get("skipped")):
+        return False, str(bt.get("reason") or "validation benchmark_timing skipped")
+    if _to_float(bt.get("speedup")) is None:
+        return False, str(bt.get("reason") or "validation benchmark_timing speedup missing")
+    return True, None
 
 
 def _baseline_speedup_from_prompt(prompt_text: str) -> float | None:
@@ -499,6 +545,14 @@ def run_speculative_pipeline(
         agent.write_metrics(metrics_path, base)
         return base
 
+    benchmark_ok, benchmark_reason = _validation_benchmark_ok(val)
+    if not benchmark_ok:
+        reason = benchmark_reason or "validation benchmark_timing did not complete"
+        base["ncu"] = {"skipped": True, "reason": reason}
+        base["status"] = val.get("status") or "benchmark_error"
+        agent.write_metrics(metrics_path, base)
+        return base
+
     if not cfg.run_ncu:
         base["ncu"] = {"skipped": True, "reason": "run_ncu disabled"}
         base["status"] = "success"
@@ -523,6 +577,7 @@ def run_speculative_pipeline(
         launch_skip=cfg.ncu_launch_skip,
         launch_count=cfg.ncu_launch_count,
         optkernel_worker_url=wurl or None,
+        ref_task_path=Path(args.task_file).resolve(),
     )
     base["ncu"] = ncu_info
     if ncu_info.get("returncode") != 0:
@@ -696,6 +751,14 @@ def _run_speculative_eval_stage(
         agent.write_metrics(metrics_path, base)
         return base
 
+    benchmark_ok, benchmark_reason = _validation_benchmark_ok(val)
+    if not benchmark_ok:
+        reason = benchmark_reason or "validation benchmark_timing did not complete"
+        base["ncu"] = {"skipped": True, "reason": reason}
+        base["status"] = val.get("status") or "benchmark_error"
+        agent.write_metrics(metrics_path, base)
+        return base
+
     if not cfg.run_ncu:
         base["ncu"] = {"skipped": True, "reason": "run_ncu disabled"}
         base["status"] = "success"
@@ -720,6 +783,7 @@ def _run_speculative_eval_stage(
         launch_skip=cfg.ncu_launch_skip,
         launch_count=cfg.ncu_launch_count,
         optkernel_worker_url=wurl or None,
+        ref_task_path=Path(args.task_file).resolve(),
     )
     base["ncu"] = ncu_info
     if ncu_info.get("returncode") != 0:
@@ -770,9 +834,13 @@ def main() -> int:
     )
     p.add_argument(
         "--start-round",
-        type=int,
-        default=0,
-        help="With --sweep: start processing from this round index (inclusive), e.g. 20 -> start from round_020.",
+        type=str,
+        default="0",
+        help=(
+            "With --sweep: start processing from this round index (inclusive), e.g. 20 -> "
+            "start from round_020. Use 'auto' to resume after the largest existing output round "
+            "under spec_act_runs/..."
+        ),
     )
     p.add_argument(
         "--max-rounds",
@@ -869,9 +937,12 @@ def main() -> int:
     if int(args.eval_queue_parallelism or 0) <= 0:
         print("--eval-queue-parallelism must be > 0", file=sys.stderr)
         return 1
-    if int(args.start_round or 0) < 0:
-        print("--start-round must be >= 0", file=sys.stderr)
-        return 1
+    if not args.sweep:
+        try:
+            _resolve_sweep_start_round(args.start_round, [])
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 1
     if int(args.max_rounds or 0) < 0:
         print("--max-rounds must be >= 0", file=sys.stderr)
         return 1
@@ -890,7 +961,19 @@ def main() -> int:
         if not rounds:
             print(f"No round_* directories under {parent}", file=sys.stderr)
             return 1
-        start_r = int(args.start_round or 0)
+        out_parent = _resolve_output_dir(parent)
+        if out_parent.is_dir():
+            try:
+                output_rounds = _discover_round_dirs(out_parent)
+            except OSError:
+                output_rounds = []
+        else:
+            output_rounds = []
+        try:
+            start_r = _resolve_sweep_start_round(args.start_round, rounds, output_rounds)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 1
         if start_r > 0:
             rounds = [rd for rd in rounds if ((_round_index_from_dirname(rd.name) or -1) >= start_r)]
             if not rounds:
