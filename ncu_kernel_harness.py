@@ -1,8 +1,9 @@
 """
-Run under ``ncu`` to profile a KernelBench-style ``kernel.py`` (no ``__main__``).
+Run under ``ncu`` to profile a KernelBench-style generated ``kernel.py`` (no ``__main__``).
 
-Loads the module, builds ``Model(*get_init_inputs())``, calls ``.eval()``, then repeats:
-``inputs = get_inputs()`` → forward, matching :func:`run_validation.run_forward_validation` call semantics.
+Loads the generated module, builds ``Model(*ref.get_init_inputs())``, calls ``.eval()``, then
+repeats ``inputs = ref.get_inputs()`` → generated forward. The optional reference task path keeps
+profiling inputs aligned with :func:`run_validation.run_forward_validation`.
 """
 
 from __future__ import annotations
@@ -42,11 +43,12 @@ def main() -> int:
     import torch
 
     if len(sys.argv) < 2:
-        print("Usage: ncu_kernel_harness.py <kernel.py> [iterations]", file=sys.stderr)
+        print("Usage: ncu_kernel_harness.py <kernel.py> [iterations] [ref_task.py]", file=sys.stderr)
         return 2
 
     kernel_path = Path(sys.argv[1]).resolve()
     iterations = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+    ref_task_path = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 and str(sys.argv[3]).strip() else None
 
     if not torch.cuda.is_available():
         print("ncu_kernel_harness: CUDA is required.", file=sys.stderr)
@@ -61,10 +63,20 @@ def main() -> int:
     except Exception:
         print(f"ncu_kernel_harness: failed to import kernel:\n{traceback.format_exc()}", file=sys.stderr)
         return 1
+    ref_mod = mod
+    if ref_task_path is not None:
+        if not ref_task_path.is_file():
+            print(f"ncu_kernel_harness: ref task file not found: {ref_task_path}", file=sys.stderr)
+            return 1
+        try:
+            ref_mod = _load_kernel(ref_task_path)
+        except Exception:
+            print(f"ncu_kernel_harness: failed to import ref task:\n{traceback.format_exc()}", file=sys.stderr)
+            return 1
 
     device = torch.device("cuda")
     try:
-        init_args = list(mod.get_init_inputs())
+        init_args = list(ref_mod.get_init_inputs())
         model = mod.Model(*init_args).to(device)
         model.eval()
     except Exception:
@@ -73,7 +85,7 @@ def main() -> int:
 
     try:
         for _ in range(iterations):
-            inputs = mod.get_inputs()
+            inputs = ref_mod.get_inputs()
             inputs_device = _move_tensors_to(inputs, device)
             if isinstance(inputs_device, torch.Tensor):
                 _ = model(inputs_device)

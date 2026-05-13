@@ -419,6 +419,20 @@ class KernelBenchAgent:
             self.write_metrics(metrics_path, base)
             return base
 
+        bt = val.get("benchmark_timing") if isinstance(val, dict) else None
+        benchmark_speedup = bt.get("speedup") if isinstance(bt, dict) else None
+        benchmark_ok = isinstance(bt, dict) and not bool(bt.get("skipped")) and benchmark_speedup is not None
+        if c.run_ncu and not benchmark_ok:
+            reason = "validation benchmark_timing did not complete"
+            if isinstance(bt, dict) and bt.get("reason"):
+                reason = str(bt.get("reason"))
+            base["ncu"] = {"skipped": True, "reason": reason}
+            eval_timing["ncu"] = {"skipped": True, "reason": reason}
+            base["status"] = val.get("status") or "benchmark_error"
+            self.write_metrics(metrics_path, base)
+            self._update_best_from_metrics(round_idx, base)
+            return base
+
         # runnable: optional ncu (remote :mod:`worker` always; else local ncu on PATH)
         if c.run_ncu and (wurl or shutil.which(nccu_bin(c.ncu_binary))):
             metric_names = effective_ncu_metrics(c.ncu_metrics)
@@ -437,6 +451,7 @@ class KernelBenchAgent:
                 launch_skip=c.ncu_launch_skip,
                 launch_count=c.ncu_launch_count,
                 optkernel_worker_url=wurl or None,
+                ref_task_path=c.task_path,
             )
             n_t1 = time.perf_counter()
             n_ts1 = _utc_iso()

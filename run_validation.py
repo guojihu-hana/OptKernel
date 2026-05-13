@@ -44,6 +44,12 @@ def _cuda_context_error_dict(exc: BaseException) -> dict[str, Any]:
     }
 
 
+def _validation_status_from_benchmark_timing(benchmark_timing: dict[str, Any]) -> str:
+    if bool(benchmark_timing.get("skipped")):
+        return "benchmark_error"
+    return "success"
+
+
 def import_kernelbench_file(path: Path, module_name: str) -> Any:
     path = path.resolve()
     sys.modules.pop(module_name, None)
@@ -408,7 +414,7 @@ def run_forward_validation(
 
     return {
         "runnable": True,
-        "status": "success",
+        "status": _validation_status_from_benchmark_timing(benchmark_timing),
         "numerical_check": num_info,
         "benchmark_timing": benchmark_timing,
     }
@@ -562,16 +568,29 @@ def _main_forward_validation_worker() -> int:
     p.add_argument("--atol", type=float, default=1e-4)
     p.add_argument("--rtol", type=float, default=1e-4)
     p.add_argument("--gen-module-name", type=str, default="kernelbench_generated_uniq")
+    p.add_argument("--optkernel-worker-url", "--worker-url", type=str, default="")
     args = p.parse_args()
     try:
-        result: dict[str, Any] = run_forward_validation(
-            args.task_file.resolve(),
-            args.kernel_file.resolve(),
-            args.seed,
-            args.atol,
-            args.rtol,
-            gen_module_name=args.gen_module_name,
-        )
+        worker_url = (args.optkernel_worker_url or "").strip()
+        if worker_url:
+            result = run_forward_validation_subprocess(
+                args.task_file.resolve(),
+                args.kernel_file.resolve(),
+                seed=args.seed,
+                atol=args.atol,
+                rtol=args.rtol,
+                gen_module_name=args.gen_module_name,
+                optkernel_worker_url=worker_url,
+            )
+        else:
+            result = run_forward_validation(
+                args.task_file.resolve(),
+                args.kernel_file.resolve(),
+                args.seed,
+                args.atol,
+                args.rtol,
+                gen_module_name=args.gen_module_name,
+            )
     except Exception as e:  # noqa: BLE001 — worker must print JSON
         result = {
             "runnable": False,

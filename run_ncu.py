@@ -342,6 +342,7 @@ def run_ncu_profile(
     *,
     launch_skip: int = SKIP_K,
     launch_count: int = PROFILE_K,
+    ref_task_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     report_path = work_dir / "kernel_profile.ncu-rep"
     cmd: list[str] = [
@@ -366,6 +367,8 @@ def run_ncu_profile(
             str(NCU_HARNESS_ITERATIONS),
         ]
     )
+    if ref_task_path is not None:
+        cmd.append(str(Path(ref_task_path).resolve()))
 
     proc = subprocess.run(
         cmd,
@@ -384,6 +387,7 @@ def run_ncu_profile(
         "launch_count": launch_count,
         "harness_script": str(_NCU_HARNESS_SCRIPT),
         "harness_kernel": str(kernel_path.resolve()),
+        "harness_ref_task": str(Path(ref_task_path).resolve()) if ref_task_path is not None else None,
         "harness_iterations": NCU_HARNESS_ITERATIONS,
     }
 
@@ -419,6 +423,7 @@ def run_ncu_profile_subprocess(
     cuda_visible_device: Optional[str] = None,
     optkernel_worker_url: Optional[str] = None,
     subprocess_timeout_s: Optional[float] = None,
+    ref_task_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     """
     Run :func:`run_ncu_profile` in a **fresh Python process** *or* POST the same work to
@@ -451,6 +456,7 @@ def run_ncu_profile_subprocess(
             extra_args,
             launch_skip=launch_skip,
             launch_count=launch_count,
+            ref_task_path=ref_task_path,
         )
     root = Path(__file__).resolve().parent
     script = root / "run_ncu.py"
@@ -476,6 +482,8 @@ def run_ncu_profile_subprocess(
         "--launch-count",
         str(launch_count),
     ]
+    if ref_task_path is not None:
+        cmd.extend(["--ref-task-file", str(Path(ref_task_path).resolve())])
     _env = os.environ.copy()
     if cuda_visible_device is not None and str(cuda_visible_device).strip() != "":
         _env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_device)
@@ -559,6 +567,8 @@ def _main_ncu_profile_worker() -> int:
     p.add_argument("--extra-json", type=str, default="[]")
     p.add_argument("--launch-skip", type=int, default=SKIP_K)
     p.add_argument("--launch-count", type=int, default=PROFILE_K)
+    p.add_argument("--ref-task-file", type=Path, default=None)
+    p.add_argument("--optkernel-worker-url", "--worker-url", type=str, default="")
     args = p.parse_args()
     try:
         names = [x.strip() for x in (args.metrics_joined or "").split(",") if x.strip()]
@@ -568,16 +578,31 @@ def _main_ncu_profile_worker() -> int:
         if not isinstance(extra, list):
             extra = []
         extra_s = [str(x) for x in extra]
-        out = run_ncu_profile(
-            args.kernel_file.resolve(),
-            args.work_dir.resolve(),
-            args.ncu_binary,
-            metrics_args,
-            extra_s,
-            metric_names,
-            launch_skip=args.launch_skip,
-            launch_count=args.launch_count,
-        )
+        worker_url = (args.optkernel_worker_url or "").strip()
+        if worker_url:
+            out = run_ncu_profile_subprocess(
+                args.kernel_file.resolve(),
+                args.work_dir.resolve(),
+                args.ncu_binary,
+                metrics_args,
+                extra_s,
+                launch_skip=args.launch_skip,
+                launch_count=args.launch_count,
+                optkernel_worker_url=worker_url,
+                ref_task_path=args.ref_task_file.resolve() if args.ref_task_file else None,
+            )
+        else:
+            out = run_ncu_profile(
+                args.kernel_file.resolve(),
+                args.work_dir.resolve(),
+                args.ncu_binary,
+                metrics_args,
+                extra_s,
+                metric_names,
+                launch_skip=args.launch_skip,
+                launch_count=args.launch_count,
+                ref_task_path=args.ref_task_file.resolve() if args.ref_task_file else None,
+            )
     except Exception as e:  # noqa: BLE001
         out = {
             "returncode": -1,
