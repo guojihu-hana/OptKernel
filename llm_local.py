@@ -528,9 +528,12 @@ class LLM:
                 think_obj["budget_tokens"] = int(cfg.thinking_budget_tokens)
             extra_body = {"thinking": think_obj}
         else:
-            # For GLM-5/5.1 on vLLM, thinking is enabled by default; explicitly disable it.
+            # For GLM-5/5.1 on vLLM, thinking is enabled by default; disable in template + API.
             # https://docs.vllm.ai/projects/recipes/en/latest/GLM/GLM5.html#openai-client-example
-            extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+            extra_body = {
+                "chat_template_kwargs": {"enable_thinking": False},
+                "thinking": {"type": "disabled"},
+            }
 
         use_stream = cfg.stream and llm_streaming_enabled()
         max_cont = 0 if not max_token_continue_enabled() else (
