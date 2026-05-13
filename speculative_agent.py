@@ -749,6 +749,8 @@ def main() -> int:
     p.add_argument("--host", type=str, required=True, help="vLLM host, e.g. http://127.0.0.1:8000")
     p.add_argument(
         "--model",
+        "--model-name",
+        dest="model",
         type=str,
         default="",
         help="Model name served by vLLM; if omitted, auto-detect first model from /v1/models",
@@ -771,6 +773,16 @@ def main() -> int:
         type=int,
         default=0,
         help="With --sweep: start processing from this round index (inclusive), e.g. 20 -> start from round_020.",
+    )
+    p.add_argument(
+        "--max-rounds",
+        type=int,
+        default=0,
+        help=(
+            "With --sweep: exclusive upper bound of round index. "
+            "Example: --start-round 4 --max-rounds 100 processes round_004..round_099. "
+            "<=0 means no upper bound."
+        ),
     )
     p.add_argument("--output-name", type=str, default="spec_prompt.txt")
     p.add_argument("--temperature", type=float, default=0.1)
@@ -860,6 +872,9 @@ def main() -> int:
     if int(args.start_round or 0) < 0:
         print("--start-round must be >= 0", file=sys.stderr)
         return 1
+    if int(args.max_rounds or 0) < 0:
+        print("--max-rounds must be >= 0", file=sys.stderr)
+        return 1
 
     if args.sweep:
         parent = args.path.resolve()
@@ -885,6 +900,16 @@ def main() -> int:
                 )
                 return 1
             print(f"Resume sweep from round_{start_r:03d}", file=sys.stderr, flush=True)
+        max_r = int(args.max_rounds or 0)
+        if max_r > 0:
+            rounds = [rd for rd in rounds if ((_round_index_from_dirname(rd.name) or -1) < max_r)]
+            if not rounds:
+                print(
+                    f"No round_* directories in range [{start_r}, {max_r}) under {parent}",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"Cap sweep to round index < {max_r}", file=sys.stderr, flush=True)
         if not (args.model or "").strip():
             args.model = _discover_model(args.host, args.api_key or "")
             print(f"Auto-discovered model: {args.model}", file=sys.stderr, flush=True)

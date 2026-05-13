@@ -5,6 +5,7 @@ figs/*
 gemm_temp_monitor.py
 plot_metrics_time_ratio.py
 runs/
+runs_no_reasoning/
 spec_act_runs/
 *.pyc
 __pycache__/
@@ -13,3 +14,4 @@ __pycache__/
 get_time_analysis.py
 plot_*.py
 pyrightconfig.json
+task_short_names.json
