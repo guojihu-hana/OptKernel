@@ -6,6 +6,8 @@ gemm_temp_monitor.py
 plot_metrics_time_ratio.py
 runs/
 runs_no_reasoning/
+tmp_test/
+logs/
 spec_act_runs/
 *.pyc
 __pycache__/

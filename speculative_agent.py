@@ -17,12 +17,13 @@ from agent import AgentConfig, KernelBenchAgent, extract_python_module
 from run_ncu import PROFILE_K, SKIP_K, effective_ncu_metrics, nccu_bin, run_ncu_profile_subprocess
 from run_validation import run_forward_validation_subprocess
 
-# Appended to every speculative prompt so the model returns a single parseable ```python block.
-SPEC_PROMPT_OUTPUT_TAIL = (
-    "\n\n---\n\n"
-    "Final instructions: keep internal reasoning brief, then respond with **only** one complete "
-    "```python ... ``` fenced code block containing the full working kernel implementation—no "
-    "preamble before the fence and no commentary after it."
+SPEC_PROMPT_THINKING_PREFIX = (
+    "Read and learn from the following thinking content (maybe partial), then generate **only** the final ```python ... ``` fenced code "
+    "block containing the full working kernel implementation.\n\n"
+    "--- thinking content ---"
+)
+SPEC_PROMPT_THINKING_SUFFIX = (
+    "\n\n--- thinking content over --- directly output the final ```python ... ``` fenced code without other outputs."
 )
 
 
@@ -408,7 +409,7 @@ def build_spec_prompt(
             note_path.write_text(note, encoding="utf-8")
     llm_text = _read_text(llm_output_path)
     llm_prefix = _first_n_tokens_text(llm_text, head_n, tokenizer_name)
-    merged = f"{prompt_text.rstrip()}\n\n{llm_prefix}{SPEC_PROMPT_OUTPUT_TAIL}"
+    merged = f"{prompt_text.rstrip()}\n\n{SPEC_PROMPT_THINKING_PREFIX}\n\n{llm_prefix}{SPEC_PROMPT_THINKING_SUFFIX}"
     out.write_text(merged, encoding="utf-8")
     return out
 

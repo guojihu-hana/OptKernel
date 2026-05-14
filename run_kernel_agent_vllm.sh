@@ -103,7 +103,7 @@ fi
 
 # Accelerate Assembling
 export MAX_JOBS=$(nproc)
-export TORCH_CUDA_ARCH_LIST="9.0"
+export TORCH_CUDA_ARCH_LIST="9.0a"
 
 python3 "${SCRIPT_DIR}/agent.py" --server-type vllm \
   --model "${MODEL_NAME}" \
