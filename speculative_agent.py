@@ -908,6 +908,11 @@ def main() -> int:
         help="With --sweep: max concurrent head jobs per round. 0 means all heads in parallel; 1 means sequential.",
     )
     p.add_argument(
+        "--sweep-skip-complete-heads",
+        action="store_true",
+        help="With --sweep: skip heads whose mirrored output dir already has metrics.json.",
+    )
+    p.add_argument(
         "--async",
         dest="async_mode",
         action="store_true",
@@ -1018,8 +1023,12 @@ def main() -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+                out_rd = _resolve_output_dir(rd)
                 for h in heads:
-                    jobs.append((rd, h, f"head{h}"))
+                    label = f"head{h}"
+                    if args.sweep_skip_complete_heads and (out_rd / label / "metrics.json").is_file():
+                        continue
+                    jobs.append((rd, h, label))
 
             if not jobs:
                 print("No runnable round-head jobs discovered.", file=sys.stderr)
@@ -1108,12 +1117,24 @@ def main() -> int:
                 file=sys.stderr,
                 flush=True,
             )
+            out_rd = _resolve_output_dir(rd)
+            heads_todo = [
+                h
+                for h in heads
+                if not (
+                    args.sweep_skip_complete_heads and (out_rd / f"head{h}" / "metrics.json").is_file()
+                )
+            ]
+            if not heads_todo:
+                print(f"Skip {rd.name}: all heads already have metrics (sweep skip).", file=sys.stderr, flush=True)
+                _write_round_sweep_log(rd, [sweep_line, "  sweep-skip-complete-heads: all done"])
+                continue
             req_parallel = int(args.head_parallelism or 0)
-            max_workers = len(heads) if req_parallel == 0 else min(len(heads), max(1, req_parallel))
+            max_workers = len(heads_todo) if req_parallel == 0 else min(len(heads_todo), max(1, req_parallel))
             if max_workers <= 1:
                 seq_line = "  parallel heads: workers=1"
                 round_log_lines.append(seq_line)
-                for h in heads:
+                for h in heads_todo:
                     label = f"head{h}"
                     print(f"  -> {label}", file=sys.stderr, flush=True)
                     result = run_speculative_pipeline(
@@ -1143,7 +1164,7 @@ def main() -> int:
                         head_n=h,
                         output_subdir=f"head{h}",
                     ): h
-                    for h in heads
+                    for h in heads_todo
                 }
                 for fut in as_completed(futs):
                     h = futs[fut]
