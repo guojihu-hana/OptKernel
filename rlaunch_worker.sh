@@ -1,6 +1,6 @@
 #!/bin/bash
 GPU_NUM=${1:-2}
-CPU_NUM=${2:-$((GPU_NUM * 16))}
+CPU_NUM=${2:-$((GPU_NUM * 20))}
 MEMORY=${3:-$((GPU_NUM * 64000))}
 echo "GPU_NUM: ${GPU_NUM}, CPU_NUM: ${CPU_NUM}, MEMORY: ${MEMORY}"
 

@@ -153,6 +153,21 @@ class AgentConfig:
     worker_url: str = ""
     # Key in ``hardware/gpu_specs.GPU_SPEC_INFO``; injected into every round's user prompt.
     gpu_type: str = "H200"
+    # --- Speculative inline agent (``--spec``) ---
+    spec_enabled: bool = False
+    spec_trigger: str = "token-heads"
+    spec_head_step: int = 2000
+    """Explicit token heads (overrides step schedule when non-empty)."""
+    spec_heads: list[int] = field(default_factory=list)
+    spec_poll_interval: float = 1.0
+    spec_tokenizer_name: str = ""
+    batch_spec: int = 8
+    spec_max_candidates: int = 0
+    """0 = unlimited additional spec kernels per round (beyond ``main``)."""
+    spec_generation_parallelism: int = 8
+    validation_parallelism: int = 8
+    profile_parallelism: int = 8
+    enable_interruption: bool = False
 
 
 class KernelBenchAgent:
@@ -162,6 +177,57 @@ class KernelBenchAgent:
         # Best (round_index, speedup) by ``benchmark_timing.speedup``; in-memory only.
         # If resuming, :meth:`run` may seed with one ``find_best_previous_round`` call.
         self._best_by_speedup: Optional[Tuple[int, float]] = None
+
+    def build_round_prompt_bundle(self, round_idx: int) -> dict[str, Any]:
+        """
+        Build system/user messages and the exact ``prompt.txt`` body for this round (no LLM call).
+
+        Returns keys: ``system``, ``user`` (message sent to the LLM), ``prompt_file_text``
+        (what we write under ``prompt.txt``).
+        """
+        c = self.config
+        if round_idx == 0:
+            system = system_prompt_round0()
+            user_body = build_user_prompt_round0(self._reference_source, gpu_type=c.gpu_type)
+        else:
+            prev_rd = self.round_dir(round_idx - 1)
+            pk = prev_rd / "kernel.py"
+            prev_kernel = (
+                pk.read_text(encoding="utf-8")
+                if pk.is_file()
+                else "# (previous round did not write kernel.py — e.g. parse_error)\n"
+            )
+            prev_metrics = prev_rd / "metrics.json"
+            summary = summarize_metrics_for_prompt(prev_metrics)
+            best = self._current_best_for_prompt(c.work_dir, round_idx)
+            system = system_prompt_roundk()
+            user_body = build_user_prompt_roundk(
+                self._reference_source,
+                prev_kernel,
+                summary,
+                gpu_type=c.gpu_type,
+                best_previous_round=best,
+                previous_round_index=round_idx - 1,
+            )
+
+        if not c.reasoning_enabled:
+            _no_reasoning_banner = (
+                "NO THINKING\n\nCRITICAL DIRECTLY OUTPUT THE CODE\n\n"
+            )
+            user = _no_reasoning_banner + user_body
+            prompt_file_text = (
+                _no_reasoning_banner
+                + f"--- system ---\n{system}\n\n--- user ---\n{user_body}"
+            )
+        else:
+            user = user_body
+            prompt_file_text = f"--- system ---\n{system}\n\n--- user ---\n{user_body}"
+
+        return {
+            "system": system,
+            "user": user,
+            "prompt_file_text": prompt_file_text,
+        }
 
     def _current_best_for_prompt(self, work_dir: Path, current_round: int) -> Optional[Tuple[int, float, str, str]]:
         t = self._best_by_speedup
@@ -281,46 +347,10 @@ class KernelBenchAgent:
         llm_out_path = rd / "llm_output.txt"
         metrics_path = rd / "metrics.json"
 
-        if round_idx == 0:
-            system = system_prompt_round0()
-            user_body = build_user_prompt_round0(self._reference_source, gpu_type=c.gpu_type)
-        else:
-            prev_rd = self.round_dir(round_idx - 1)
-            pk = prev_rd / "kernel.py"
-            prev_kernel = (
-                pk.read_text(encoding="utf-8")
-                if pk.is_file()
-                else "# (previous round did not write kernel.py — e.g. parse_error)\n"
-            )
-            prev_metrics = prev_rd / "metrics.json"
-            summary = summarize_metrics_for_prompt(prev_metrics)
-            best = self._current_best_for_prompt(c.work_dir, round_idx)
-            system = system_prompt_roundk()
-            user_body = build_user_prompt_roundk(
-                self._reference_source,
-                prev_kernel,
-                summary,
-                gpu_type=c.gpu_type,
-                best_previous_round=best,
-                previous_round_index=round_idx - 1,
-            )
-
-        if not c.reasoning_enabled:
-            _no_reasoning_banner = (
-                "NO THINKING\n\nCRITICAL DIRECTLY OUTPUT THE CODE\n\n"
-            )
-            user = _no_reasoning_banner + user_body
-            prompt_path.write_text(
-                _no_reasoning_banner
-                + f"--- system ---\n{system}\n\n--- user ---\n{user_body}",
-                encoding="utf-8",
-            )
-        else:
-            user = user_body
-            prompt_path.write_text(
-                f"--- system ---\n{system}\n\n--- user ---\n{user_body}",
-                encoding="utf-8",
-            )
+        b = self.build_round_prompt_bundle(round_idx)
+        system = str(b["system"])
+        user = str(b["user"])
+        prompt_path.write_text(str(b["prompt_file_text"]), encoding="utf-8")
 
         ll_t0 = time.perf_counter()
         ll_ts0 = _utc_iso()
@@ -375,19 +405,35 @@ class KernelBenchAgent:
         kernel_path.write_text(py_src, encoding="utf-8")
         return base
 
-    def run_round(self, round_idx: int) -> dict[str, Any]:
+    def _validate_and_ncu_candidate(
+        self,
+        *,
+        round_idx: int,
+        kernel_path: Path,
+        cand_work_dir: Path,
+        metrics_path: Path,
+        gen_mod_name: str,
+        seed_eval_timing: Optional[dict[str, Any]] = None,
+        extra_top: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Run validation (+ optional NCU) for one kernel under ``cand_work_dir``; writes ``metrics_path``."""
         c = self.config
         task_name = c.task_path.stem
-        rd = self.round_dir(round_idx)
-        kernel_path = rd / "kernel.py"
-        metrics_path = rd / "metrics.json"
+        base: dict[str, Any] = {
+            "round": round_idx,
+            "task_path": str(c.task_path.resolve()),
+            "work_dir": str(cand_work_dir.resolve()),
+            "model_name": c.model_name,
+        }
+        if extra_top:
+            base.update(extra_top)
+        eval_timing: dict[str, Any] = dict(seed_eval_timing or {})
 
-        base = self.run_generation(round_idx)
-        if base.get("status") in ("parse_error", "llm_subprocess_error"):
+        if not kernel_path.is_file():
+            base.update({"runnable": False, "status": "spec_parse_error"})
+            self.write_metrics(metrics_path, base)
             return base
 
-        gen_mod_name = f"kernelbench_generated_r{round_idx}"
-        eval_timing: dict[str, Any] = dict(base.get("eval_timing") or {})
         v_t0 = time.perf_counter()
         v_ts0 = _utc_iso()
         _log_phase_start(round_idx, "validation", v_ts0, task_name)
@@ -408,7 +454,6 @@ class KernelBenchAgent:
             "finished_at": v_ts1,
             "seconds": round(v_t1 - v_t0, 6),
         }
-        # Worker queue timing belongs to timing section (not top-level validation payload).
         v_qt = val.pop("queue_timing", None) if isinstance(val, dict) else None
         if v_qt is not None:
             eval_timing["validation"]["queue_timing"] = v_qt
@@ -430,10 +475,8 @@ class KernelBenchAgent:
             eval_timing["ncu"] = {"skipped": True, "reason": reason}
             base["status"] = val.get("status") or "benchmark_error"
             self.write_metrics(metrics_path, base)
-            self._update_best_from_metrics(round_idx, base)
             return base
 
-        # runnable: optional ncu (remote :mod:`worker` always; else local ncu on PATH)
         if c.run_ncu and (wurl or shutil.which(nccu_bin(c.ncu_binary))):
             metric_names = effective_ncu_metrics(c.ncu_metrics)
             metrics_comma = ",".join(metric_names)
@@ -444,7 +487,7 @@ class KernelBenchAgent:
             _log_phase_start(round_idx, "ncu", n_ts0, task_name)
             ncu_info = run_ncu_profile_subprocess(
                 kernel_path,
-                rd,
+                cand_work_dir,
                 c.ncu_binary,
                 metrics_args,
                 c.ncu_extra_args,
@@ -482,8 +525,34 @@ class KernelBenchAgent:
             base["status"] = "success"
 
         self.write_metrics(metrics_path, base)
-        self._update_best_from_metrics(round_idx, base)
         return base
+
+    def run_round(self, round_idx: int) -> dict[str, Any]:
+        c = self.config
+        if c.spec_enabled:
+            from agent_spec_scheduler import execute_spec_round
+
+            return execute_spec_round(self, round_idx)
+
+        rd = self.round_dir(round_idx)
+        kernel_path = rd / "kernel.py"
+        metrics_path = rd / "metrics.json"
+
+        base = self.run_generation(round_idx)
+        if base.get("status") in ("parse_error", "llm_subprocess_error"):
+            return base
+
+        gen_mod_name = f"kernelbench_generated_r{round_idx}"
+        fin = self._validate_and_ncu_candidate(
+            round_idx=round_idx,
+            kernel_path=kernel_path,
+            cand_work_dir=rd,
+            metrics_path=metrics_path,
+            gen_mod_name=gen_mod_name,
+            seed_eval_timing=dict(base.get("eval_timing") or {}),
+        )
+        self._update_best_from_metrics(round_idx, fin)
+        return fin
 
     def run(self) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
@@ -648,6 +717,73 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         default="",
         help="Comma-separated rounds where reasoning is OFF; all other rounds ON (default thinking on).",
     )
+    p.add_argument("--spec", action="store_true", help="Inline speculative kernels from streaming main output.")
+    p.add_argument(
+        "--spec-trigger",
+        type=str,
+        default="token-heads",
+        choices=["token-heads"],
+        help="Spec trigger backend (currently only token-heads).",
+    )
+    p.add_argument(
+        "--spec-head-step",
+        type=int,
+        default=2000,
+        help="Token step N for token-heads triggers (fires at N,2N,... when output reaches). Ignored when --spec-heads is non-empty.",
+    )
+    p.add_argument(
+        "--spec-heads",
+        type=str,
+        default="",
+        help='Comma-separated token counts to trigger (e.g. "2000,4000"); overrides stepped schedule.',
+    )
+    p.add_argument(
+        "--spec-poll-interval",
+        type=float,
+        default=1.0,
+        help="Seconds between reads of streaming llm_output.txt while polling for spec triggers.",
+    )
+    p.add_argument(
+        "--spec-tokenizer",
+        type=str,
+        default="",
+        help="Optional HF tokenizer repo id for counting heads (else tiktoken cl100k).",
+    )
+    p.add_argument(
+        "--batch-spec",
+        type=int,
+        default=8,
+        help="Parallel spec LLM jobs per trigger (default 8). Use 1 for single spec per head.",
+    )
+    p.add_argument(
+        "--spec-max-candidates",
+        type=int,
+        default=0,
+        help="Cap total spec candidates per round (0 = unlimited). Does not count main.",
+    )
+    p.add_argument(
+        "--spec-generation-parallelism",
+        type=int,
+        default=8,
+        help="Max concurrent spec LLM subprocesses.",
+    )
+    p.add_argument(
+        "--validation-parallelism",
+        type=int,
+        default=8,
+        help="Max concurrent validation (+NCU) pipelines across candidates per round.",
+    )
+    p.add_argument(
+        "--profile-parallelism",
+        type=int,
+        default=8,
+        help="Reserved for future split profile stage; currently validation pool uses max(validation, profile).",
+    )
+    p.add_argument(
+        "--enable-interruption",
+        action="store_true",
+        help="Run pluggable interruption policies on spec triggers (v1: log-only).",
+    )
     args = p.parse_args(argv)
 
     _st = args.server_type.strip().lower()
@@ -698,6 +834,21 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
     if int(args.thinking_budget_tokens or 0) < 0:
         p.error("--thinking-budget-tokens must be >= 0")
 
+    def _parse_int_list(csv: str) -> list[int]:
+        out: list[int] = []
+        for part in (csv or "").split(","):
+            part = part.strip()
+            if part:
+                out.append(int(part))
+        return sorted({x for x in out if x > 0})
+
+    spec_heads = _parse_int_list(args.spec_heads)
+    if bool(args.spec):
+        if float(args.spec_poll_interval) < 0:
+            p.error("--spec-poll-interval must be >= 0")
+        if not spec_heads and int(args.spec_head_step) <= 0:
+            p.error("--spec-head-step must be positive when --spec is set (or pass --spec-heads)")
+
     return AgentConfig(
         task_path=task_path,
         work_dir=work_dir,
@@ -729,6 +880,18 @@ def parse_args(argv: Optional[list[str]] = None) -> AgentConfig:
         repetition_penalty=_rep,
         worker_url=(args.worker_url or "").strip(),
         gpu_type=args.gpu_type,
+        spec_enabled=bool(args.spec),
+        spec_trigger=str(args.spec_trigger or "token-heads"),
+        spec_head_step=max(1, int(args.spec_head_step or 2000)),
+        spec_heads=spec_heads,
+        spec_poll_interval=float(args.spec_poll_interval or 1.0),
+        spec_tokenizer_name=(args.spec_tokenizer or "").strip(),
+        batch_spec=max(1, int(args.batch_spec or 8)),
+        spec_max_candidates=max(0, int(args.spec_max_candidates or 0)),
+        spec_generation_parallelism=max(1, int(args.spec_generation_parallelism or 8)),
+        validation_parallelism=max(1, int(args.validation_parallelism or 8)),
+        profile_parallelism=max(1, int(args.profile_parallelism or 8)),
+        enable_interruption=bool(args.enable_interruption),
     )
 
 
