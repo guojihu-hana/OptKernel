@@ -274,9 +274,14 @@ class KernelBenchAgent:
         user: str,
         round_idx: int,
         llm_output_path: Optional[Path] = None,
+        *,
+        is_reasoning_model: Optional[bool] = None,
     ) -> dict[str, Any]:
         """
         Single LLM call via a child process (see :func:`run_llm.run_llm_subprocess`).
+
+        ``is_reasoning_model`` overrides :meth:`reasoning_for_round` when set (e.g. spec
+        completions pass ``False`` for ``--no-reasoning``-equivalent behaviour).
 
         On success: ``{"ok": true, "text", "llm_output_dumped"}``.
 
@@ -298,6 +303,9 @@ class KernelBenchAgent:
             usr_p = work / "user.txt"
             sys_p.write_text(system, encoding="utf-8")
             usr_p.write_text(user, encoding="utf-8")
+            use_reasoning = (
+                self.reasoning_for_round(round_idx) if is_reasoning_model is None else bool(is_reasoning_model)
+            )
             res = run_llm_subprocess(
                 sys_p,
                 usr_p,
@@ -309,7 +317,7 @@ class KernelBenchAgent:
                 server_address=c.server_address,
                 server_port=c.server_port,
                 model_name=c.model_name,
-                is_reasoning_model=self.reasoning_for_round(round_idx),
+                is_reasoning_model=use_reasoning,
                 budget_tokens=int(c.thinking_budget_tokens or 0),
                 reasoning_effort=str(c.reasoning_effort or "medium"),
                 openai_compatible_api_key=c.openai_compatible_api_key,

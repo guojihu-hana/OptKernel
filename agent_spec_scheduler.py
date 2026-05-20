@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import re
 import shutil
+import sys
 import threading
 import time
+from concurrent.futures import CancelledError as FutureCancelled
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,7 +139,83 @@ def _new_token_heads(nt: int, fired: set[int], *, step: int, explicit: list[int]
     return sorted(new)
 
 
+def _finalize_spec_aborted_after_main(
+    agent: KernelBenchAgent, cr: _CandRecord, *, detail: str
+) -> _CandRecord:
+    m = dict(cr.metrics)
+    m.setdefault("candidate_id", cr.candidate_id)
+    et = m.get("eval_timing") if isinstance(m.get("eval_timing"), dict) else {}
+    has_val = "validation" in et
+    if m.get("kernel_extracted") and not has_val:
+        m["runnable"] = False
+        m["status"] = "spec_aborted_after_main"
+        m["abort_reason"] = detail
+        agent.write_metrics(cr.work_dir / "metrics.json", m)
+    return _CandRecord(cr.candidate_id, cr.role, cr.work_dir, m)
+
+
+def _drain_candidate_val_future(
+    *,
+    agent: KernelBenchAgent,
+    cid: str,
+    cr: _CandRecord,
+    vf: Optional[Future[_CandRecord]],
+    is_main: bool,
+) -> _CandRecord:
+    """Join validation/NCU future for one candidate; abort spec work when main-owned round ends."""
+    if is_main:
+        if vf is None:
+            return cr
+        try:
+            return vf.result()
+        except Exception as e:
+            m = dict(cr.metrics)
+            m.setdefault("candidate_id", cid)
+            m["pipeline_error"] = str(e)
+            agent.write_metrics(cr.work_dir / "metrics.json", m)
+            return _CandRecord(cid, cr.role, cr.work_dir, m)
+
+    if vf is None:
+        return _finalize_spec_aborted_after_main(
+            agent,
+            cr,
+            detail="main reasoning finished before speculative validation started",
+        )
+
+    if not vf.done():
+        vf.cancel()
+
+    if vf.done():
+        try:
+            return vf.result()
+        except FutureCancelled:
+            pass
+        except Exception as e:
+            m = dict(cr.metrics)
+            m.setdefault("candidate_id", cid)
+            m["pipeline_error"] = str(e)
+            agent.write_metrics(cr.work_dir / "metrics.json", m)
+            return _CandRecord(cid, cr.role, cr.work_dir, m)
+
+    return _finalize_spec_aborted_after_main(
+        agent,
+        cr,
+        detail="speculative validation/profile cancelled when main reasoning finished",
+    )
+
+
 def execute_spec_round(agent: KernelBenchAgent, round_idx: int) -> dict[str, Any]:
+    """Spec round: main streaming LLM + speculative completions **only during** main reasoning.
+
+    While main is still generating, speculative jobs may emit ``kernel.py`` and enqueue
+    validation/profile on ``val_exec``. When **main reasoning finishes**, speculative generation
+    is cancelled and speculative validation/profile futures are cancelled (best-effort; in-flight
+    GPU subprocesses may still complete). Only **main** is guaranteed to run the full GPU
+    pipeline afterward. Candidates left without ``eval_timing.validation`` use
+    ``status=spec_aborted_after_main`` where applicable. The winner is picked from metrics for
+    all candidates (including speculative jobs that finished benchmarking before shutdown), then
+    :meth:`KernelBenchAgent._update_best_from_metrics` updates cross-round history from the winner.
+    """
     c = agent.config
     rd = agent.round_dir(round_idx)
     rd.mkdir(parents=True, exist_ok=True)
@@ -165,6 +243,86 @@ def execute_spec_round(agent: KernelBenchAgent, round_idx: int) -> dict[str, Any
         c.enable_interruption,
         LoggingInterruptionPolicy() if c.enable_interruption else None,
     )
+
+    gathered: dict[str, _CandRecord] = {}
+    pending_val_futs: dict[str, Future[_CandRecord]] = {}
+    round_lock = threading.Lock()
+    main_finished_evt = threading.Event()
+
+    val_workers = max(1, int(c.validation_parallelism), int(c.profile_parallelism))
+    val_exec = ThreadPoolExecutor(max_workers=val_workers)
+
+    def _pipeline_one(cr: _CandRecord) -> _CandRecord:
+        if cr.role == "spec" and main_finished_evt.is_set():
+            return _finalize_spec_aborted_after_main(
+                agent,
+                cr,
+                detail="speculative pipeline skipped — main reasoning already finished",
+            )
+        kp = cr.work_dir / "kernel.py"
+        gen_mod = f"kernelbench_generated_r{round_idx}_{re.sub(r'[^a-zA-Z0-9_]', '_', cr.candidate_id)}"
+        extra = {
+            "candidate_id": cr.candidate_id,
+            "candidate_role": cr.role,
+        }
+        m = agent._validate_and_ncu_candidate(
+            round_idx=round_idx,
+            kernel_path=kp,
+            cand_work_dir=cr.work_dir,
+            metrics_path=cr.work_dir / "metrics.json",
+            gen_mod_name=gen_mod,
+            seed_eval_timing=dict(cr.metrics.get("eval_timing") or {}),
+            extra_top=extra,
+        )
+        return _CandRecord(cr.candidate_id, cr.role, cr.work_dir, m)
+
+    def _make_spec_gen_done_cb(cid: str, wd: Path):
+        def _cb(fut: Future[_CandRecord]) -> None:
+            try:
+                rec = fut.result()
+            except FutureCancelled:
+                wd.mkdir(parents=True, exist_ok=True)
+                err = {
+                    "round": round_idx,
+                    "task_path": str(c.task_path.resolve()),
+                    "work_dir": str(wd.resolve()),
+                    "model_name": c.model_name,
+                    "candidate_id": cid,
+                    "runnable": False,
+                    "status": "spec_generation_cancelled",
+                    "candidate_role": "spec",
+                }
+                mp = wd / "metrics.json"
+                agent.write_metrics(mp, err)
+                rec = _CandRecord(cid, "spec", wd, err)
+                with round_lock:
+                    gathered[cid] = rec
+                return
+            except Exception as e:
+                wd.mkdir(parents=True, exist_ok=True)
+                err = {
+                    "round": round_idx,
+                    "task_path": str(c.task_path.resolve()),
+                    "work_dir": str(wd.resolve()),
+                    "model_name": c.model_name,
+                    "candidate_id": cid,
+                    "runnable": False,
+                    "status": "spec_future_error",
+                    "runtime_error": str(e),
+                    "candidate_role": "spec",
+                }
+                mp = wd / "metrics.json"
+                agent.write_metrics(mp, err)
+                rec = _CandRecord(cid, "spec", wd, err)
+                with round_lock:
+                    gathered[cid] = rec
+                return
+            with round_lock:
+                gathered[cid] = rec
+                if rec.metrics.get("kernel_extracted") and not main_finished_evt.is_set():
+                    pending_val_futs[cid] = val_exec.submit(_pipeline_one, rec)
+
+        return _cb
 
     gen_executor = ThreadPoolExecutor(max_workers=max(1, int(c.spec_generation_parallelism)))
 
@@ -235,6 +393,7 @@ def execute_spec_round(agent: KernelBenchAgent, round_idx: int) -> dict[str, Any
                     cid,
                     suf,
                 )
+                fut.add_done_callback(_make_spec_gen_done_cb(cid, wd))
                 futures.append((cid, fut))
 
     main_box: list[dict[str, Any]] = []
@@ -279,23 +438,20 @@ def execute_spec_round(agent: KernelBenchAgent, round_idx: int) -> dict[str, Any
         time.sleep(poll)
 
     t_main.join()
-    # Final poll for heads that complete together with stream end
-    snap = ""
-    if llm_out_path.is_file():
-        snap = llm_out_path.read_text(encoding="utf-8", errors="replace")
-    nt = count_tokens(snap, tokenizer)
-    heads = _new_token_heads(
-        nt,
-        fired_heads,
-        step=max(1, int(c.spec_head_step or 2000)),
-        explicit=list(c.spec_heads or []),
-    )
-    if heads:
-        _enqueue_specs_for_heads(heads, snap)
 
-    gen_executor.shutdown(wait=True)
+    with round_lock:
+        main_finished_evt.set()
+        for _p_cid, _p_vf in list(pending_val_futs.items()):
+            if _p_cid != "main":
+                _p_vf.cancel()
 
-    gathered: dict[str, _CandRecord] = {}
+    for _, fut_g in futures:
+        fut_g.cancel()
+
+    _shutdown_kw: dict[str, Any] = {"wait": False}
+    if sys.version_info >= (3, 9):
+        _shutdown_kw["cancel_futures"] = True
+    gen_executor.shutdown(**_shutdown_kw)
 
     llm_combo = main_box[0] if main_box else {"llm": {"ok": False}, "llm_eval_timing": {}}
     llm_res = llm_combo["llm"]
@@ -319,74 +475,24 @@ def execute_spec_round(agent: KernelBenchAgent, round_idx: int) -> dict[str, Any
         main_kernel_path,
     )
 
-    gathered["main"] = _CandRecord("main", "main", main_dir, main_base)
+    main_cr = _CandRecord("main", "main", main_dir, main_base)
+    with round_lock:
+        gathered["main"] = main_cr
+        if bool(main_base.get("kernel_extracted")):
+            pending_val_futs["main"] = val_exec.submit(_pipeline_one, main_cr)
 
-    for cid, fut in futures:
-        try:
-            rec = fut.result()
-            gathered[cid] = rec
-        except Exception as e:
-            wd = cand_root / cid
-            wd.mkdir(parents=True, exist_ok=True)
-            err = {
-                "round": round_idx,
-                "task_path": str(c.task_path.resolve()),
-                "work_dir": str(wd.resolve()),
-                "model_name": c.model_name,
-                "candidate_id": cid,
-                "runnable": False,
-                "status": "spec_future_error",
-                "runtime_error": str(e),
-                "candidate_role": "spec",
-            }
-            mp = wd / "metrics.json"
-            agent.write_metrics(mp, err)
-            gathered[cid] = _CandRecord(cid, "spec", wd, err)
-
-    # Pipeline validate + NCU — parallel breadth
-    work_items: list[_CandRecord] = list(gathered.values())
-    val_exec = ThreadPoolExecutor(
-        max_workers=max(1, int(c.validation_parallelism), int(c.profile_parallelism))
-    )
-
-    validated: dict[str, _CandRecord] = {cr.candidate_id: cr for cr in gathered.values()}
-
-    val_futs: list[tuple[str, Future[_CandRecord]]] = []
-
-    def _pipeline_one(cr: _CandRecord) -> _CandRecord:
-        kp = cr.work_dir / "kernel.py"
-        gen_mod = f"kernelbench_generated_r{round_idx}_{re.sub(r'[^a-zA-Z0-9_]', '_', cr.candidate_id)}"
-        extra = {
-            "candidate_id": cr.candidate_id,
-            "candidate_role": cr.role,
-        }
-        m = agent._validate_and_ncu_candidate(
-            round_idx=round_idx,
-            kernel_path=kp,
-            cand_work_dir=cr.work_dir,
-            metrics_path=cr.work_dir / "metrics.json",
-            gen_mod_name=gen_mod,
-            seed_eval_timing=dict(cr.metrics.get("eval_timing") or {}),
-            extra_top=extra,
+    validated: dict[str, _CandRecord] = {}
+    for cid, cr in sorted(gathered.items()):
+        vf = pending_val_futs.get(cid)
+        validated[cid] = _drain_candidate_val_future(
+            agent=agent,
+            cid=cid,
+            cr=cr,
+            vf=vf,
+            is_main=(cid == "main"),
         )
-        return _CandRecord(cr.candidate_id, cr.role, cr.work_dir, m)
 
-    for cr in work_items:
-        if cr.role == "main" or cr.metrics.get("kernel_extracted"):
-            val_futs.append((cr.candidate_id, val_exec.submit(_pipeline_one, cr)))
-
-    for cid, vf in val_futs:
-        try:
-            validated[cid] = vf.result()
-        except Exception as e:
-            cr = gathered[cid]
-            m = dict(cr.metrics)
-            m.setdefault("candidate_id", cid)
-            m["pipeline_error"] = str(e)
-            agent.write_metrics(cr.work_dir / "metrics.json", m)
-            validated[cid] = _CandRecord(cid, cr.role, cr.work_dir, m)
-
-    val_exec.shutdown(wait=True)
+    val_exec.shutdown(wait=False)
 
     winner = pick_winner(candidate_metrics={k: v.metrics for k, v in validated.items()})
     final_metrics = finalize_round_layout(
@@ -553,7 +659,7 @@ def _run_one_spec_generation(
 
     ll_t0 = time.perf_counter()
     llm_out = work_dir / "llm_output.txt"
-    llm_res = agent.call_llm(system_s, user_s, round_idx, llm_out)
+    llm_res = agent.call_llm(system_s, user_s, round_idx, llm_out, is_reasoning_model=False)
     ll_t1 = time.perf_counter()
     llm_eval_timing = {
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),

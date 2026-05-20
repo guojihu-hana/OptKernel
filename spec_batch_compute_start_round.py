@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Used by ``run_spec_*_batch.sh`` when ``PARALLEL_MODE=rounds``.
+Used by ``sh/run_spec_*_batch.sh`` when ``PARALLEL_MODE=rounds``.
 
 1. Lists every ``spec_act_runs/.../round_*`` numeric index under the task mirror.
 2. Takes the **last N rounds** by index (``N = --parallel-window``, e.g. ``MAX_PARALLEL=10``
